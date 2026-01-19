@@ -4,7 +4,7 @@ import numpy as np
 import math
 
 # ================= USER CONFIG ================= #
-IMAGE_PATH = "D:\\Dhrishti\\rosbags\\pune2_4km_300_10_20260108_03014320260108_175531\\frame_00185.jpg"
+IMAGE_PATH = "D:\\Dhrishti\\rosbags\\pun1_6km_700_0_20260106_02355920260106_161121\\frame_00935.jpg"
 # =============================================== #
 
 # ---------- Utils ----------
@@ -31,34 +31,38 @@ if img is None:
 
 H, W = img.shape[:2]
 
-cv2.namedWindow("GUI", cv2.WINDOW_NORMAL)
-cv2.resizeWindow("GUI", W, H)
+cv2.namedWindow("Controls", cv2.WINDOW_NORMAL)
+cv2.namedWindow("Preview", cv2.WINDOW_NORMAL)
+cv2.resizeWindow("Controls", 420, H)
+cv2.resizeWindow("Preview", W, H)
+cv2.moveWindow("Controls", 20, 20)
+cv2.moveWindow("Preview", 460, 20)
 
 # ---------- Trackbars ----------
-cv2.createTrackbar("LEFT_X", "GUI", int(W * 0.3), W - 2, lambda x: None)
-cv2.createTrackbar("LEFT_ANGLE", "GUI", 180, 360, lambda x: None)  # -180 .. +180
-cv2.createTrackbar("RIGHT_X", "GUI", int(W * 0.6), W - 1, lambda x: None)
+cv2.createTrackbar("LEFT_X", "Controls", int(W * 0.3), W - 2, lambda x: None)
+cv2.createTrackbar("LEFT_ANGLE", "Controls", 180, 360, lambda x: None)  # -180 .. +180
+cv2.createTrackbar("RIGHT_X", "Controls", int(W * 0.6), W - 1, lambda x: None)
 
-cv2.createTrackbar("Alpha x100", "GUI", 120, 300, lambda x: None)
-cv2.createTrackbar("Gamma x100", "GUI", 100, 300, lambda x: None)
+cv2.createTrackbar("Alpha x100", "Controls", 120, 300, lambda x: None)
+cv2.createTrackbar("Gamma x100", "Controls", 100, 300, lambda x: None)
 
-cv2.createTrackbar("NLM Strength", "GUI", 7, 30, lambda x: None)
-cv2.createTrackbar("Destripe x100", "GUI", 40, 100, lambda x: None)
+cv2.createTrackbar("NLM Strength", "Controls", 7, 30, lambda x: None)
+cv2.createTrackbar("Destripe x100", "Controls", 40, 100, lambda x: None)
 
 # ---------- Main loop ----------
 while True:
-    left_x_base = cv2.getTrackbarPos("LEFT_X", "GUI")
-    right_x = cv2.getTrackbarPos("RIGHT_X", "GUI")
+    left_x_base = cv2.getTrackbarPos("LEFT_X", "Controls")
+    right_x = cv2.getTrackbarPos("RIGHT_X", "Controls")
     right_x = max(left_x_base + 10, right_x)
 
-    angle_deg = cv2.getTrackbarPos("LEFT_ANGLE", "GUI") - 180
+    angle_deg = cv2.getTrackbarPos("LEFT_ANGLE", "Controls") - 180
     angle_rad = math.radians(angle_deg)
 
-    alpha = cv2.getTrackbarPos("Alpha x100", "GUI") / 100.0
-    gamma = cv2.getTrackbarPos("Gamma x100", "GUI") / 100.0
+    alpha = cv2.getTrackbarPos("Alpha x100", "Controls") / 100.0
+    gamma = cv2.getTrackbarPos("Gamma x100", "Controls") / 100.0
 
-    nlm_h = cv2.getTrackbarPos("NLM Strength", "GUI")
-    destripe_strength = cv2.getTrackbarPos("Destripe x100", "GUI") / 100.0
+    nlm_h = cv2.getTrackbarPos("NLM Strength", "Controls")
+    destripe_strength = cv2.getTrackbarPos("Destripe x100", "Controls") / 100.0
 
     # ---- Compute slanted LEFT boundary per row ----
     rows = np.arange(H)
@@ -104,13 +108,13 @@ while True:
         roi_row = apply_gamma(roi_row, gamma)
         output[y, lx:rx] = roi_row
 
-    cv2.imshow("GUI", output)
+    cv2.imshow("Preview", output)
 
     key = cv2.waitKey(30)
     if key == 27 or key == ord('q'):
         break
     if key == ord('s'):
-        cv2.imwrite("output_gui_result.png", output)
-        print("Saved output_gui_result.png")
+        cv2.imwrite("postprocess-atharva.png", output)
+        print("Saved postprocess-atharva.png")
 
 cv2.destroyAllWindows()

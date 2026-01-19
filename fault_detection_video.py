@@ -8,11 +8,11 @@ from datetime import datetime
 # import argparse  # Commented out since we're using hardcoded paths
 
 # Configuration variables - Edit these as needed
-VIDEO_PATH = r"D:\Dhrishti\Drishti_DMRC_data\basler_1767303407.mp4"  # Path to your input video file
-MODEL_PATH = r"D:\Dhrishti\YOLO\v4\FaultDetection_v4.pt"                          # Path to your PyTorch model (.pt file)
+VIDEO_PATH = r"D:\rosbags_17thJan\ace_delhi2_20260116_033518\ace_delhi2_20260116_03351820260117_172917.avi"  # Path to your input video file
+MODEL_PATH = r"D:\Dhrishti\YOLO\v4.1\faultdetection_v4.1.pt"                          # Path to your PyTorch model (.pt file)
 PLAYBACK_SPEED = 1.5                                              # Playback speed multiplier (0.25x = slower, 1.0x = normal, 2.0x = faster)
-OUTPUT_DIR = r"D:\Dhrishti\Drishti_DMRC_data\Output1"              # Base directory for saving detected frames
-CONFIDENCE_THRESHOLD = 0.2                                    # Detection confidence threshold
+OUTPUT_DIR = r"D:\Dhrishti\Drishti_DMRC_data\Output_jan_2026\ace_delhi2_20260116_03351820260117_172917"              # Base directory for saving detected frames
+CONFIDENCE_THRESHOLD = 0.5                                    # Detection confidence threshold
 
 def load_model(model_path):
     """
@@ -58,6 +58,12 @@ def postprocess_output(results, frame):
 def main(video_path, model_path, playback_speed=1.0, output_dir=None):
     # Load the model
     model = load_model(model_path)
+    device = "cuda:0" if torch.cuda.is_available() else "cpu"
+    model.to(device)
+    if device.startswith("cuda"):
+        print(f"Running inference on GPU ({device})")
+    else:
+        print("Running inference on CPU (CUDA not available)")
 
     # Open video capture
     cap = cv2.VideoCapture(video_path)
@@ -106,7 +112,7 @@ def main(video_path, model_path, playback_speed=1.0, output_dir=None):
             break
 
         # Run inference using YOLO (no preprocessing needed for YOLO)
-        results = model(frame, conf=CONFIDENCE_THRESHOLD)  # Adjust confidence threshold as needed
+        results = model(frame, conf=CONFIDENCE_THRESHOLD, device=device)  # Adjust confidence threshold as needed
 
         # Post-process and overlay results on frame
         processed_frame = postprocess_output(results, frame)

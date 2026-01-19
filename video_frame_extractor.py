@@ -3,10 +3,11 @@ import os
 from datetime import datetime
 
 # Configuration variables - Edit these as needed
-VIDEO_PATH = r"D:\Drishti\Drishti_DMRC_data\Re-oriented\feed1_reoriented.mp4"  # Path to your input video file
-OUTPUT_DIR = r"D:\Drishti\Drishti_DMRC_data\Extracted_Frames"                   # Base directory for saving extracted frames
-IMAGE_FORMAT = "jpg"                                                            # Output image format: jpg, png, bmp
+VIDEO_PATH = r"D:\rosbags_17thJan\ace_delhi_1_return_20260115_044439\ace_delhi_1_return_20260115_04443920260117_125830.avi"  # Path to your input video file
+OUTPUT_DIR = r"D:\rosbags_17thJan\ace_delhi_1_return_20260115_044439\Frames"                   # Base directory for saving extracted frames
+IMAGE_FORMAT = "png"                                                            # Output image format: jpg, png, bmp
 JPEG_QUALITY = 95                                                               # JPEG quality (1-100), only used if IMAGE_FORMAT is jpg
+USE_CUDA = True                                                                 # Use CUDA decode if available
 
 
 def extract_frames(video_path, output_dir, image_format="jpg", jpeg_quality=95):
@@ -24,21 +25,42 @@ def extract_frames(video_path, output_dir, image_format="jpg", jpeg_quality=95):
         print(f"Error: Video file not found: {video_path}")
         return
     
-    # Open video capture
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        print(f"Error: Could not open video file {video_path}")
-        return
+    # Open video capture (prefer CUDA decode if available)
+    use_cuda = False
+    cuda_reader = None
+    cap = None
+    if USE_CUDA and hasattr(cv2, "cuda") and cv2.cuda.getCudaEnabledDeviceCount() > 0:
+        try:
+            cuda_reader = cv2.cudacodec.createVideoReader(video_path)
+            use_cuda = True
+            print("Using CUDA video decode")
+        except Exception as exc:
+            print(f"CUDA decode unavailable, falling back to CPU ({exc})")
+            use_cuda = False
+
+    if not use_cuda:
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            print(f"Error: Could not open video file {video_path}")
+            return
     
     # Get video properties
-    video_fps = cap.get(cv2.CAP_PROP_FPS)
+    if use_cuda:
+        video_fps = 0
+    else:
+        video_fps = cap.get(cv2.CAP_PROP_FPS)
     if video_fps <= 0:
         print("Warning: Could not detect video FPS, defaulting to 30")
         video_fps = 30
     
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    if use_cuda:
+        total_frames = 0
+        width = 0
+        height = 0
+    else:
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     duration = total_frames / video_fps if video_fps > 0 else 0
     
     # Get video filename without extension
@@ -71,7 +93,13 @@ def extract_frames(video_path, output_dir, image_format="jpg", jpeg_quality=95):
     saved_count = 0
     
     while True:
-        ret, frame = cap.read()
+        if use_cuda:
+            ret, gpu_frame = cuda_reader.nextFrame()
+            if not ret:
+                break
+            frame = gpu_frame.download()
+        else:
+            ret, frame = cap.read()
         if not ret:
             break
         
@@ -79,7 +107,7 @@ def extract_frames(video_path, output_dir, image_format="jpg", jpeg_quality=95):
         
         # Generate filename with zero-padded frame number
         # Calculate padding based on total frames
-        padding = len(str(total_frames))
+        padding = len(str(total_frames)) if total_frames > 0 else 6
         filename = f"frame_{frame_count:0{padding}d}.{image_format}"
         filepath = os.path.join(frames_dir, filename)
         
@@ -94,12 +122,16 @@ def extract_frames(video_path, output_dir, image_format="jpg", jpeg_quality=95):
         saved_count += 1
         
         # Print progress every 100 frames or at specific percentages
-        if frame_count % 100 == 0 or frame_count == total_frames:
-            progress = (frame_count / total_frames) * 100 if total_frames > 0 else 0
-            print(f"  Progress: {frame_count}/{total_frames} frames ({progress:.1f}%)")
+        if frame_count % 100 == 0 or (total_frames > 0 and frame_count == total_frames):
+            if total_frames > 0:
+                progress = (frame_count / total_frames) * 100
+                print(f"  Progress: {frame_count}/{total_frames} frames ({progress:.1f}%)")
+            else:
+                print(f"  Progress: {frame_count} frames")
     
     # Clean up
-    cap.release()
+    if cap is not None:
+        cap.release()
     
     print("\n" + "=" * 60)
     print("EXTRACTION COMPLETE")
