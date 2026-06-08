@@ -13,7 +13,7 @@ import time  # For measuring inference time
 # ============================================================================
 VIDEO_PATH = r"/media/viraj/New Volume/Dhrishti/Day 6/ace_delhi_6_10m20260124_050136/ace_delhi_6_10m20260124_050136.avi"  # Path to your input video file
 MODEL_PATH = r"/media/viraj/New Volume/Dhrishti/YOLO/v4.1/faultdetection_v4.1.pt"                          # Path to your PyTorch model (.pt file)
-PLAYBACK_SPEED = 1.5                                              # Playback speed multiplier (0.25x = slower, 1.0x = normal, 2.0x = faster)
+PLAYBACK_SPEED = 1.0                                              # Playback speed multiplier (0.25x = slower, 1.0x = normal, 2.0x = faster)
 OUTPUT_DIR = r"/home/viraj/inference_trial"              # Base directory for saving detected frames
 CONFIDENCE_THRESHOLD = 0.425                                   # Detection confidence threshold (0.0-1.0)
 
@@ -68,6 +68,62 @@ def preprocess_frame(frame, input_size=(1024, 626)):
     # Add batch dimension (model expects batch of images)
     frame_tensor = transform(frame_resized).unsqueeze(0)
     return frame_tensor
+
+
+def calculate_iou(bbox1, bbox2):
+    """
+    Calculate Intersection over Union (IoU) of two bounding boxes.
+    Used to detect duplicate detections across consecutive frames.
+
+    Args:
+        bbox1 (list): First bounding box [x1, y1, x2, y2]
+        bbox2 (list): Second bounding box [x1, y1, x2, y2]
+
+    Returns:
+        float: IoU score between 0 and 1 (1.0 = identical boxes, 0.0 = no overlap)
+    """
+    x1_min, y1_min, x1_max, y1_max = bbox1
+    x2_min, y2_min, x2_max, y2_max = bbox2
+
+    # Calculate intersection area
+    intersection_x = max(0, min(x1_max, x2_max) - max(x1_min, x2_min))
+    intersection_y = max(0, min(y1_max, y2_max) - max(y1_min, y2_min))
+    intersection_area = intersection_x * intersection_y
+
+    # Calculate union area
+    area1 = (x1_max - x1_min) * (y1_max - y1_min)
+    area2 = (x2_max - x2_min) * (y2_max - y2_min)
+    union_area = area1 + area2 - intersection_area
+
+    # Calculate IoU
+    iou = intersection_area / union_area if union_area > 0 else 0
+    return iou
+
+
+def get_bbox_center_distance(bbox, frame_width, frame_height):
+    """
+    Calculate distance from bounding box center to frame center.
+    Lower distance = defect more centered in frame.
+
+    Args:
+        bbox (list): Bounding box [x1, y1, x2, y2]
+        frame_width (int): Width of frame
+        frame_height (int): Height of frame
+
+    Returns:
+        float: Euclidean distance from bbox center to frame center
+    """
+    x1, y1, x2, y2 = bbox
+    bbox_center_x = (x1 + x2) / 2
+    bbox_center_y = (y1 + y2) / 2
+
+    frame_center_x = frame_width / 2
+    frame_center_y = frame_height / 2
+
+    # Calculate Euclidean distance
+    distance = np.sqrt((bbox_center_x - frame_center_x) ** 2 +
+                       (bbox_center_y - frame_center_y) ** 2)
+    return distance
 
 
 def postprocess_output(results, frame):
@@ -209,30 +265,11 @@ def main(video_path, model_path, playback_speed=1.0, output_dir=None):
             detection_count += detections
             confidence = results[0].boxes.conf.max().item() if detections > 0 else 0
 
-            # Get class names and save frames organized by detection type
-            class_names = results[0].names
-            saved_labels = set()
-            for cls_id in results[0].boxes.cls.cpu().numpy().astype(int):
-                label = class_names.get(int(cls_id), f"class_{cls_id}")
-                if label in saved_labels:
-                    continue
-                saved_labels.add(label)
+            filename = f"frame_{current_frame_index:04d}_{detections}_{confidence:.2f}.jpg"
+            faults_path = os.path.join(faults_dir, filename)
+            cv2.imwrite(faults_path, frame)
 
-                # Create class-specific directory
-                class_dir = os.path.join(run_dir, label)
-                os.makedirs(class_dir, exist_ok=True)
-
-                # Save annotated frame
-                filename = f"frame_{current_frame_index:04d}_{detections}_{confidence:.2f}.jpg"
-                filepath = os.path.join(class_dir, filename)
-                cv2.imwrite(filepath, processed_frame)
-
-                # Save original frame to faults directory
-                if faults_dir:
-                    faults_path = os.path.join(faults_dir, filename)
-                    cv2.imwrite(faults_path, frame)
-
-            print(f"Frame {current_frame_index:4d} | Detections: {detections} | Confidence: {confidence:.2f} | Inference: {inference_time_ms:.2f}ms")
+            print(f"Frame {current_frame_index:4d} | Detections: {detections} | Confidence: {confidence:.2f} | SAVED | Inference: {inference_time_ms:.2f}ms")
 
         # ====================================================================
         # DISPLAY FRAME
@@ -283,7 +320,7 @@ def main(video_path, model_path, playback_speed=1.0, output_dir=None):
             print(f"                            {video_duration_hours:.2f} hours")
 
         print(f"\n🔍 Detection Summary:")
-        print(f"  Total frames with detections: {len([t for t in inference_times if t > 0])}")
+        print(f"  Total frames processed: {frame_count}")
         print(f"  Total detections found: {detection_count}")
 
         print(f"\n⏱️  Inference Time Statistics:")
