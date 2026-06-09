@@ -3,16 +3,17 @@ import os
 from datetime import datetime
 
 # Configuration variables - Edit these as needed
-VIDEO_PATH = r"D:\rosbags_17thJan\ace_delhi_1_return_20260115_044439\ace_delhi_1_return_20260115_04443920260117_125830.avi"  # Path to your input video file
-OUTPUT_DIR = r"D:\rosbags_17thJan\ace_delhi_1_return_20260115_044439\Frames"                   # Base directory for saving extracted frames
+VIDEO_PATH = r"/home/viraj/Downloads/TOTA_feed2.mp4"  # Path to your input video file
+OUTPUT_DIR = r"/media/viraj/New Volume/Dataset/Weapons_V2/TOTA_feed"                  # Base directory for saving extracted frames
 IMAGE_FORMAT = "png"                                                            # Output image format: jpg, png, bmp
-JPEG_QUALITY = 95                                                               # JPEG quality (1-100), only used if IMAGE_FORMAT is jpg
+JPEG_QUALITY = 100                                                               # JPEG quality (1-100), only used if IMAGE_FORMAT is jpg
 USE_CUDA = True                                                                 # Use CUDA decode if available
 
 
-def extract_frames(video_path, output_dir, image_format="jpg", jpeg_quality=95):
+def extract_frames(video_path, output_dir, image_format="jpg", jpeg_quality=100):
     """
-    Extract all frames from a video file and save them to the output directory.
+    Extract all frames from a video file and save them to the output directory.claude
+    
     
     Args:
         video_path: Path to the input video file
@@ -44,23 +45,28 @@ def extract_frames(video_path, output_dir, image_format="jpg", jpeg_quality=95):
             print(f"Error: Could not open video file {video_path}")
             return
     
-    # Get video properties
+    # Get video properties (use a metadata-only CPU capture when decoding on GPU)
+    video_fps = 0
+    total_frames = 0
+    width = 0
+    height = 0
     if use_cuda:
-        video_fps = 0
+        meta_cap = cv2.VideoCapture(video_path)
+        if meta_cap.isOpened():
+            video_fps = meta_cap.get(cv2.CAP_PROP_FPS)
+            total_frames = int(meta_cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            width = int(meta_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            height = int(meta_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            meta_cap.release()
     else:
         video_fps = cap.get(cv2.CAP_PROP_FPS)
-    if video_fps <= 0:
-        print("Warning: Could not detect video FPS, defaulting to 30")
-        video_fps = 30
-    
-    if use_cuda:
-        total_frames = 0
-        width = 0
-        height = 0
-    else:
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+    if video_fps <= 0:
+        print("Warning: Could not detect video FPS, defaulting to 30")
+        video_fps = 30
     duration = total_frames / video_fps if video_fps > 0 else 0
     
     # Get video filename without extension
@@ -91,17 +97,30 @@ def extract_frames(video_path, output_dir, image_format="jpg", jpeg_quality=95):
     
     frame_count = 0
     saved_count = 0
+    pending_frame = None
+
+    if use_cuda and (width == 0 or height == 0):
+        ret, gpu_frame = cuda_reader.nextFrame()
+        if not ret:
+            print("Error: Could not read from CUDA decoder")
+            return
+        pending_frame = gpu_frame.download()
+        height, width = pending_frame.shape[:2]
     
     while True:
-        if use_cuda:
+        if pending_frame is not None:
+            frame = pending_frame
+            pending_frame = None
+            ret = True
+        elif use_cuda:
             ret, gpu_frame = cuda_reader.nextFrame()
             if not ret:
                 break
             frame = gpu_frame.download()
         else:
             ret, frame = cap.read()
-        if not ret:
-            break
+            if not ret:
+                break
         
         frame_count += 1
         

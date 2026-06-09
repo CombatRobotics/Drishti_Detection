@@ -3,3 +3,15 @@ torch
 torchvision
 numpy
 ultralytics
+
+# ONNX and TensorRT (for model conversion and optimization)
+onnx>=1.13.0
+onnxslim>=0.1.71
+onnx-simplifier>=0.4.30
+onnxruntime-gpu>=1.15.0
+tensorrt>=10.0.0
+pycuda>=2022.2
+
+# Additional utilities
+tqdm
+Pillow

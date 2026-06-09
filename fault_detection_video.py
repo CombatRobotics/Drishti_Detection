@@ -6,13 +6,20 @@ from ultralytics import YOLO
 import os
 from datetime import datetime
 import time  # For measuring inference time
-# import argparse  # Commented out since we're using hardcoded paths
+import argparse
+
+# Set random seeds for deterministic results (consistent detections across runs)
+torch.manual_seed(42)
+np.random.seed(42)
+torch.cuda.manual_seed_all(42)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
 
 # ============================================================================
 # CONFIGURATION VARIABLES - Edit these as needed
 # ============================================================================
 VIDEO_PATH = r"/media/viraj/New Volume/Dhrishti/Day 6/ace_delhi_6_10m20260124_050136/ace_delhi_6_10m20260124_050136.avi"  # Path to your input video file
-MODEL_PATH = r"/media/viraj/New Volume/Dhrishti/YOLO/v4.1/faultdetection_v4.1.pt"                          # Path to your PyTorch model (.pt file)
+MODEL_PATH = r"/media/viraj/New Volume/Dhrishti/YOLO/v4.1/faultdetection_v4.1.onnx"                          # Path to your PyTorch model (.pt file)
 PLAYBACK_SPEED = 1.0                                              # Playback speed multiplier (0.25x = slower, 1.0x = normal, 2.0x = faster)
 OUTPUT_DIR = r"/home/viraj/inference_trial"              # Base directory for saving detected frames
 CONFIDENCE_THRESHOLD = 0.425                                   # Detection confidence threshold (0.0-1.0)
@@ -20,10 +27,10 @@ CONFIDENCE_THRESHOLD = 0.425                                   # Detection confi
 
 def load_model(model_path):
     """
-    Load the YOLO model from the .pt file using ultralytics library.
+    Load the YOLO model from various formats (PyTorch, ONNX, or TensorRT engine).
 
     Args:
-        model_path (str): Path to the YOLO model file (.pt format)
+        model_path (str): Path to the YOLO model file (.pt, .onnx, or .engine format)
 
     Returns:
         YOLO: Loaded YOLO model object ready for inference
@@ -148,7 +155,7 @@ def main(video_path, model_path, playback_speed=1.0, output_dir=None):
 
     Args:
         video_path (str): Path to input video file
-        model_path (str): Path to YOLO model (.pt file)
+        model_path (str): Path to YOLO model (.pt, .onnx, or .engine file)
         playback_speed (float): Playback speed multiplier (default: 1.0)
         output_dir (str): Directory to save detected frames (optional)
     """
@@ -165,13 +172,38 @@ def main(video_path, model_path, playback_speed=1.0, output_dir=None):
     print("FAULT DETECTION VIDEO PROCESSOR")
     print("="*70)
 
+    # Determine device and model type
+    model_extension = model_path.split('.')[-1].lower()
+    is_pytorch_model = model_extension == 'pt'
+    is_onnx_model = model_extension == 'onnx'
+
+    # For ONNX models, use CPU to avoid CUDA library version conflicts
+    if is_onnx_model:
+        device = "cpu"
+        print("\n⚠️  ONNX models use CPU inference (avoids CUDA library conflicts)")
+    else:
+        device = "cuda:0" if torch.cuda.is_available() else "cpu"
+
     model = load_model(model_path)
-    device = "cuda:0" if torch.cuda.is_available() else "cpu"
-    model.to(device)
+
+    # Only move PyTorch models to device
+    # .engine and .onnx files are pre-compiled and don't support .to(device)
+    if is_pytorch_model:
+        model.to(device)
+
     if device.startswith("cuda"):
         print(f"\n✓ Running inference on GPU ({device})")
     else:
         print("\n⚠ Running inference on CPU (CUDA not available)")
+
+    # Show model type
+    model_type = model_extension.upper()
+    model_format_name = {
+        'pt': 'PyTorch',
+        'onnx': 'ONNX',
+        'engine': 'TensorRT Engine'
+    }.get(model_extension, model_extension.upper())
+    print(f"✓ Model type: {model_format_name} (.{model_extension})")
 
     # ========================================================================
     # STEP 2: Open Video File and Read Metadata
@@ -348,6 +380,88 @@ def main(video_path, model_path, playback_speed=1.0, output_dir=None):
         else:
             required_speedup = video_fps / achieved_fps
             print(f"  ✓ Real-time capable: NO (would need {required_speedup:.2f}x faster inference)")
+
+        # ====================================================================
+        # SAVE METRICS TO TEXT FILE
+        # ====================================================================
+        if run_dir:
+            metrics_file = os.path.join(run_dir, "performance_metrics.txt")
+
+            # Get model info
+            model_filename = os.path.basename(MODEL_PATH)
+            model_extension = os.path.splitext(model_filename)[1]  # .pt, .engine, etc.
+            gpu_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU"
+
+            with open(metrics_file, 'w') as f:
+                f.write("\n" + "="*70 + "\n")
+                f.write("FAULT DETECTION - COMPLETE PERFORMANCE METRICS\n")
+                f.write("="*70 + "\n\n")
+
+                f.write("💻 SYSTEM INFORMATION:\n")
+                f.write(f"  GPU/Device: {gpu_name}\n")
+                f.write(f"  CUDA available: {torch.cuda.is_available()}\n")
+                if torch.cuda.is_available():
+                    f.write(f"  CUDA version: {torch.version.cuda}\n")
+                    f.write(f"  cuDNN version: {torch.backends.cudnn.version()}\n")
+                f.write(f"\n")
+
+                f.write("🔧 MODEL INFORMATION:\n")
+                f.write(f"  Model file: {model_filename}\n")
+                f.write(f"  Model type: {model_extension}\n")
+                f.write(f"  Model path: {MODEL_PATH}\n")
+                f.write(f"  Confidence threshold: {CONFIDENCE_THRESHOLD}\n")
+                f.write(f"  Temporal dedup gap: {DEDUP_MIN_FRAME_GAP} frames\n")
+                f.write(f"\n")
+
+                f.write("📹 VIDEO INFORMATION:\n")
+                f.write(f"  Video file: {os.path.basename(video_path)}\n")
+                f.write(f"  Resolution: {width}x{height}\n")
+                f.write(f"  FPS: {video_fps}\n")
+                f.write(f"  Total frames: {total_frames}\n")
+                f.write(f"  Original video duration: {video_duration_seconds:.2f} seconds ({video_duration_minutes:.2f} min)\n")
+                if video_duration_hours > 0:
+                    f.write(f"                            {video_duration_hours:.2f} hours\n")
+                f.write(f"\n")
+
+                f.write("🔍 DETECTION SUMMARY:\n")
+                f.write(f"  Total frames processed: {frame_count}\n")
+                f.write(f"  Total detections found: {detection_count}\n")
+                f.write(f"  Unique detections saved: {unique_count}\n")
+                f.write(f"  Duplicate detections skipped: {duplicate_count}\n")
+                if detection_count > 0:
+                    dedup_percentage = (duplicate_count / detection_count * 100)
+                    f.write(f"  Reduction rate: {dedup_percentage:.1f}%\n")
+                f.write(f"\n")
+
+                f.write("⏱️  INFERENCE TIME STATISTICS:\n")
+                f.write(f"  Average per frame: {avg_inference_time:.2f} ms\n")
+                f.write(f"  Minimum per frame: {min_inference_time:.2f} ms\n")
+                f.write(f"  Maximum per frame: {max_inference_time:.2f} ms\n")
+                f.write(f"  Total inference time: {total_inference_time/1000:.2f} seconds ({total_inference_time/1000/60:.2f} min)\n")
+                f.write(f"\n")
+
+                f.write("⏳ TOTAL EXECUTION TIME:\n")
+                f.write(f"  Total elapsed time (wall clock): {total_elapsed_time:.2f} seconds ({total_elapsed_time/60:.2f} min)\n")
+                f.write(f"  Processing overhead (I/O, display, etc): {overhead_time:.2f} seconds ({overhead_percentage:.1f}%)\n")
+                f.write(f"\n")
+
+                f.write("📊 PROCESSING EFFICIENCY:\n")
+                f.write(f"  Processing speed: {speedup_factor:.2f}x (processed {speedup_factor:.2f} seconds of video per second)\n")
+                f.write(f"  Achieved inference FPS: {achieved_fps:.2f} fps\n")
+                f.write(f"  Expected video playback FPS: {video_fps}\n")
+                f.write(f"\n")
+
+                if achieved_fps >= video_fps:
+                    f.write(f"  ✓ Real-time capable: YES (inference fast enough for {video_fps} fps)\n")
+                else:
+                    required_speedup = video_fps / achieved_fps
+                    f.write(f"  ✓ Real-time capable: NO (would need {required_speedup:.2f}x faster inference)\n")
+
+                f.write("\n" + "="*70 + "\n")
+                f.write(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                f.write("="*70 + "\n\n")
+
+            print(f"✓ Metrics saved to: {metrics_file}\n")
 
     print("="*70 + "\n")
 
