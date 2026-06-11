@@ -36,7 +36,7 @@ MODEL_PATH = r"/media/viraj/New Volume/Dhrishti/YOLO/v4.1/faultdetection_v4.1.en
 PLAYBACK_SPEED = 1.0
 OUTPUT_DIR = r"/home/viraj/inference_trial2"
 CONFIDENCE_THRESHOLD = 0.425
-DETERMINISM_LEVEL = 1  # 0 = none, 1 = basic, 2 = GPU-level, 3 = maximum
+DETERMINISM_LEVEL = 2  # 0 = none, 1 = basic, 2 = GPU-level, 3 = maximum
 
 
 def setup_determinism(level: int):
