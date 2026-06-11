@@ -4,13 +4,16 @@ torchvision
 numpy
 ultralytics
 
-# ONNX and TensorRT (for model conversion and optimization)
+# Model formats supported: PyTorch (.pt) and TensorRT Engine (.engine)
+# GPU acceleration
+tensorrt>=10.0.0
+pycuda>=2022.2
+
+# ONNX tools for model conversion (PyTorch -> TensorRT Engine)
 onnx>=1.13.0
 onnxslim>=0.1.71
 onnx-simplifier>=0.4.30
-onnxruntime-gpu>=1.15.0
-tensorrt>=10.0.0
-pycuda>=2022.2
+# onnxruntime-gpu>=1.15.0  (not used - inference only via PyTorch or TensorRT)
 
 # Additional utilities
 tqdm

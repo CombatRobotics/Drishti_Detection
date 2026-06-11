@@ -21,11 +21,19 @@ Install the required packages:
 pip install -r requirements.txt
 ```
 
-**Optional:**
-- **FFmpeg** — If you want to cross-check frame decoding from videos independently, you can install FFmpeg on your system
+**Required:**
+- **FFmpeg** — Essential for MJPEG video preprocessing (ensures reliable frame-by-frame decoding across all video codecs)
   - Install on Ubuntu: `sudo apt-get install ffmpeg`
   - Install on macOS: `brew install ffmpeg`
   - Install on Windows: Download from https://ffmpeg.org/download.html
+
+**Supported Model Formats for Inference:**
+- **PyTorch** (`.pt` files) — Full YOLO model format
+- **TensorRT Engine** (`.engine` files) — Optimized inference format for NVIDIA GPUs
+
+**Model Conversion (PyTorch → TensorRT):**
+- ONNX tools are included for model conversion workflow
+- Inference via ONNX is **not supported** — Use PyTorch or TensorRT instead
 
 ---
 
@@ -33,23 +41,34 @@ pip install -r requirements.txt
 
 **Script:** `fault_detection_video.py`
 
-Processes a video file using a YOLO fault detection model, running inference on each frame and displaying results in real-time. Automatically saves frames with detections to timestamped output directories. Frame rate is automatically extracted from the video metadata using OpenCV, which handles inconsistent frame rates gracefully.
+Processes a video file using a YOLO fault detection model with automatic MJPEG preprocessing for reliable frame-by-frame decoding. Runs inference on every frame and displays results in real-time. Automatically saves frames with detections to timestamped output directories.
+
+**Key Innovation: MJPEG Preprocessing**
+- Automatically transcodes input video to MJPEG format via FFmpeg
+- Ensures OpenCV reads every frame exactly once (no frame loss)
+- Handles all video codecs (H.264, MPEG-4, HEVC, AV1, etc.) with consistent results
+- Solves metadata ambiguity issues that cause frame count discrepancies
 
 ### Configuration
 
 Edit the configuration variables at the top of `fault_detection_video.py`:
 
 ```python
-VIDEO_PATH = r"D:\Drishti\basler_1767303407.mp4"  # Input video file
-MODEL_PATH = r"D:\Drishti\135epochs.pt"          # YOLO model (.pt file)
-OUTPUT_DIR = r"D:\Drishti\Output"                # Output directory for detected frames
+VIDEO_PATH = r"D:\Drishti\basler_1767303407.avi"  # Input video file (any format)
+MODEL_PATH = r"D:\Drishti\model.pt"               # YOLO model (.pt or .engine)
+OUTPUT_DIR = r"D:\Drishti\Output"                 # Output directory for detected frames
+CONFIDENCE_THRESHOLD = 0.425                       # Detection confidence threshold
+DETERMINISM_LEVEL = 2                             # 0=none, 1=basic, 2=GPU-level, 3=maximum
 ```
 
 ### Features
 
-- **Automatic frame extraction** using OpenCV (works with inconsistent frame rates)
+- **MJPEG preprocessing** — Automatic transcoding for deterministic frame reading
+- **Codec-agnostic** — Works with any video format (AVI, MP4, MOV, MKV, etc.)
 - **Real-time YOLO inference** with live bounding box visualization
-- **Organized output** — Timestamped folders (e.g., `run_20260102_143022`)
+- **GPU-accelerated** — Supports PyTorch and TensorRT Engine models
+- **Deterministic results** — Reproducible across systems (local, DGX, cloud)
+- **Organized output** — Timestamped folders with comprehensive metrics
 
 ### Output
 
@@ -133,20 +152,39 @@ Floating-point operations on GPUs can vary slightly between different hardware c
 
 ---
 
-## Complete Pipeline Example
+## Usage Examples
 
+### Basic fault detection (with MJPEG preprocessing):
 ```bash
-# 1. Extract faults from video
+python3 fault_detection_video.py
+```
+
+### Fault detection with custom paths:
+```bash
+python3 fault_detection_video.py \
+  --video-path /path/to/video.avi \
+  --model-path /path/to/model.pt \
+  --output-dir /path/to/output \
+  --confidence-threshold 0.425 \
+  --determinism-level 2
+```
+
+### Complete pipeline:
+```bash
+# 1. Extract faults from video (with automatic MJPEG preprocessing)
 python3 fault_detection_video.py
 
 # 2. Deduplicate detections (choose one strategy)
 python3 deduplicate_spatial_similarity_with_category.py ./Output/run_20260102_143022/
-# or
+# or use temporal deduplication
 python3 deduplicate_temporal.py ./Output/run_20260102_143022/
-# or
+# or use spatiotemporal clustering
 python3 deduplicate_spatiotemporal_faults.py ./Output/run_20260102_143022/
 
-# 3. (Optional) Lightroom integration
+# 3. Extract frames for geometric normalization (work in progress)
+python3 video_frame_extractor.py
+
+# 4. (Optional) Lightroom integration
 python3 post-process/Lightroom_API/lightroom_api.py  # Authenticate first
 ```
 
