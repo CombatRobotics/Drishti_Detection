@@ -1,6 +1,17 @@
-# Fault Detection Video Processor
+# Dhrishti Rail Fault Detection & Processing Pipeline
 
-This script processes a video file using a PyTorch fault detection model, running inference on each frame and displaying the results in real-time. It supports both RGB and greyscale video input.
+A comprehensive computer vision pipeline for detecting, deduplicating, and geometrically standardizing rail head defects from video footage. Integrates YOLO-based detection, spatial deduplication, geometric normalization, and Adobe Lightroom for batch editing.
+
+## Overview
+
+This project implements a complete end-to-end pipeline for rail inspection:
+
+1. **Fault Detection** — Extract defective frames from video using YOLO
+2. **Deduplication** — Remove spatial and temporal redundancy
+3. **Geometric Normalization** — Deskew, center, and standardize resolution
+4. **Lightroom Integration** — Batch import standardized frames for editing
+
+---
 
 ## Requirements
 
@@ -10,66 +21,140 @@ Install the required packages:
 pip install -r requirements.txt
 ```
 
-## Configuration
+**Optional:**
+- **FFmpeg** — If you want to cross-check frame decoding from videos independently, you can install FFmpeg on your system
+  - Install on Ubuntu: `sudo apt-get install ffmpeg`
+  - Install on macOS: `brew install ffmpeg`
+  - Install on Windows: Download from https://ffmpeg.org/download.html
+
+---
+
+## Stage 1: Fault Detection from Video
+
+**Script:** `fault_detection_video.py`
+
+Processes a video file using a YOLO fault detection model, running inference on each frame and displaying results in real-time. Automatically saves frames with detections to timestamped output directories. Frame rate is automatically extracted from the video metadata using OpenCV, which handles inconsistent frame rates gracefully.
+
+### Configuration
 
 Edit the configuration variables at the top of `fault_detection_video.py`:
 
 ```python
-# Configuration variables - Edit these as needed
-VIDEO_PATH = r"D:\Drishti\Drishti_DMRC_data\basler_1767303407.mp4"  # Path to your input video file
-MODEL_PATH = r"D:\Drishti\135epochs.pt"                           # Path to your PyTorch model (.pt file)
-FRAME_RATE = 35                                                  # Desired frame rate for processing
-PLAYBACK_SPEED = 0.25                                            # Playback speed multiplier (0.25x = slower, 1.0x = normal, 2.0x = faster)
-OUTPUT_DIR = r"D:\Drishti\Drishti_DMRC_data\Output"              # Base directory for saving detected frames
+VIDEO_PATH = r"D:\Drishti\basler_1767303407.mp4"  # Input video file
+MODEL_PATH = r"D:\Drishti\135epochs.pt"          # YOLO model (.pt file)
+OUTPUT_DIR = r"D:\Drishti\Output"                # Output directory for detected frames
 ```
 
-### Playback Speed Options:
-- `0.25` = 0.25x speed (slower playback, good for detailed analysis)
-- `1.0` = 1x speed (normal speed)
-- `2.0` = 2x speed (faster playback)
+### Features
 
-## Features
+- **Automatic frame extraction** using OpenCV (works with inconsistent frame rates)
+- **Real-time YOLO inference** with live bounding box visualization
+- **Organized output** — Timestamped folders (e.g., `run_20260102_143022`)
 
-- **Real-time fault detection** with YOLO model
-- **Automatic frame saving**: Frames with detections are automatically saved to timestamped subfolders
-- **Configurable playback speed** for detailed analysis
-- **Live video display** with bounding boxes overlaid
-- **Organized output**: Each run creates a new timestamped folder (e.g., `run_20260102_143022`)
+### Output
 
-## Controls
-
-- Press 'q' to quit the video processing
-
-## Customization
-
-### Model Loading
-The `load_model` function currently loads a standard PyTorch model. If your model requires special loading (e.g., with specific device or additional parameters), modify this function.
-
-### Preprocessing
-The `preprocess_frame` function assumes the model expects 224x224 input with ImageNet normalization. Adjust the `input_size` and normalization values based on your model's requirements.
-
-### Post-processing
-The `postprocess_output` function is a placeholder. Implement the actual post-processing logic based on your model's output format:
-
-- For **classification**: Display class labels and confidence scores
-- For **object detection**: Draw bounding boxes around detected faults
-- For **segmentation**: Overlay segmentation masks
-
-Example for object detection:
-
-```python
-def postprocess_output(output, frame):
-    # Assuming output is [batch, num_boxes, 5] with [x1, y1, x2, y2, confidence]
-    boxes = output[0]  # Remove batch dimension
-    for box in boxes:
-        if box[4] > 0.5:  # Confidence threshold
-            x1, y1, x2, y2 = box[:4].int()
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-    return frame
 ```
+Output/run_20260102_143022/
+├── frame_001_detection.jpg
+├── frame_002_detection.jpg
+└── ...
+```
+
+Each frame contains:
+- Original frame with YOLO bounding boxes overlaid
+- Detection class labels and confidence scores
+
+### Controls
+
+- Press 'q' to quit video processing
+
+---
+
+## Stage 2: Deduplication
+
+After fault detection, the extracted frames often contain duplicate or near-duplicate detections due to temporal overlap in video frames. This stage intelligently deduplicates based on spatial, temporal, or combined spatiotemporal information while preserving unique defects.
+
+### Deduplication Scripts
+
+- **Spatial Similarity** (`deduplicate_spatial_similarity_with_category.py`) — Removes spatially similar detections within a threshold distance, optionally filtering by defect category
+- **Temporal Deduplication** (`deduplicate_temporal.py`) — Removes consecutive frame duplicates
+- **Spatiotemporal Clustering** (`deduplicate_spatiotemporal_faults.py`) — Combines spatial and temporal information for holistic deduplication
+
+### Usage
+
+**Spatial deduplication (all categories):**
+```bash
+python3 deduplicate_spatial_similarity_with_category.py /path/to/detected_frames/
+```
+
+**Filter by defect category:**
+```bash
+python3 deduplicate_spatial_similarity_with_category.py /path/to/detected_frames/ --category crack
+```
+
+**Temporal deduplication:**
+```bash
+python3 deduplicate_temporal.py /path/to/detected_frames/
+```
+
+**Spatiotemporal deduplication:**
+```bash
+python3 deduplicate_spatiotemporal_faults.py /path/to/detected_frames/
+```
+
+### Output
+
+```
+deduplicated_output/run_20260102_143022/
+├── frame_001_unique.jpg
+├── frame_005_unique.jpg
+└── metadata.jsonl
+```
+
+---
+
+## Stage 3: Geometric Normalization (Work in Progress)
+
+**Status:** This stage is currently under development. Scripts for deskewing and centering deduplicated frames are available in `stage1_deskew_robust.py` and related utilities.
+
+---
+
+## Stage 4: Adobe Lightroom Integration
+
+The output from the deskewed and centered script is used as input for editing in Adobe Lightroom.
+
+---
+
+## GPU Determinism
+
+When running deep learning models on NVIDIA GPUs, GPU-to-GPU determinism is enabled to ensure consistent results across different NVIDIA cards. This means that the same input will produce identical outputs when executed on any NVIDIA GPU, which is critical for reproducibility and reliability in fault detection workflows.
+
+Floating-point operations on GPUs can vary slightly between different hardware configurations due to differences in how reductions and operations are implemented. NVIDIA provides mechanisms to control this behavior. For more information on controlling floating-point determinism in NVIDIA CUDA, see: https://developer.nvidia.com/blog/controlling-floating-point-determinism-in-nvidia-cccl/#:~:text=CUB%20in%20NVIDIA%20CUDA%20Core,levels%20via%20the%20execution%20environment
+
+---
+
+## Complete Pipeline Example
+
+```bash
+# 1. Extract faults from video
+python3 fault_detection_video.py
+
+# 2. Deduplicate detections (choose one strategy)
+python3 deduplicate_spatial_similarity_with_category.py ./Output/run_20260102_143022/
+# or
+python3 deduplicate_temporal.py ./Output/run_20260102_143022/
+# or
+python3 deduplicate_spatiotemporal_faults.py ./Output/run_20260102_143022/
+
+# 3. (Optional) Lightroom integration
+python3 post-process/Lightroom_API/lightroom_api.py  # Authenticate first
+```
+
+---
 
 ## Notes
 
-- The script processes frames at the specified frame rate, regardless of the video's original frame rate
-- Processing speed may be limited by your hardware and model complexity
-- For very fast models, you can achieve real-time processing at the video's native frame rate
+- Frame rate is automatically extracted from video metadata using OpenCV
+- Deduplication strategies can be chosen based on your data characteristics (spatial, temporal, or spatiotemporal)
+- The pipeline is designed for rail inspection but generalizes to other defect detection scenarios
+- Processing speed scales with available CPU cores
