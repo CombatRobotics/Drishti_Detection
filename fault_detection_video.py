@@ -1,488 +1,547 @@
+#!/usr/bin/env python3
+"""
+Production-Grade Fault Detection Pipeline
+==========================================
+
+Reliable video frame processing using OpenCV frame-by-frame decoding.
+Counts ACTUAL decoded frames (not metadata) for reproducibility across systems.
+
+Key Features:
+- Reliable frame counting (works with any codec)
+- Production-grade error handling
+- Comprehensive performance metrics
+- Reproducible across systems (local, DGX, cloud)
+- Real-time display with adjustable speed
+"""
+
+import os
+import argparse
 import cv2
 import torch
 import numpy as np
-from torchvision import transforms
-from ultralytics import YOLO
-import os
+import json
+import platform
+import subprocess
 from datetime import datetime
-import time  # For measuring inference time
-import argparse
-
-# Set random seeds for deterministic results (consistent detections across runs)
-torch.manual_seed(42)
-np.random.seed(42)
-torch.cuda.manual_seed_all(42)
-torch.backends.cudnn.deterministic = True
-torch.backends.cudnn.benchmark = False
+from pathlib import Path
+import time
+from typing import Tuple, Optional
+from ultralytics import YOLO
 
 # ============================================================================
-# CONFIGURATION VARIABLES - Edit these as needed
+# CONFIGURATION
 # ============================================================================
-VIDEO_PATH = r"/media/viraj/New Volume/Dhrishti/Day 6/ace_delhi_6_10m20260124_050136/ace_delhi_6_10m20260124_050136.avi"  # Path to your input video file
-MODEL_PATH = r"/media/viraj/New Volume/Dhrishti/YOLO/v4.1/faultdetection_v4.1.onnx"                          # Path to your PyTorch model (.pt file)
-PLAYBACK_SPEED = 1.0                                              # Playback speed multiplier (0.25x = slower, 1.0x = normal, 2.0x = faster)
-OUTPUT_DIR = r"/home/viraj/inference_trial"              # Base directory for saving detected frames
-CONFIDENCE_THRESHOLD = 0.425                                   # Detection confidence threshold (0.0-1.0)
+VIDEO_PATH = r"/media/viraj/New Volume/Dhrishti/Day 6/ace_delhi_6_10m20260124_050136/ace_delhi_6_10m20260124_050136.avi"
+MODEL_PATH = r"/media/viraj/New Volume/Dhrishti/YOLO/v4.1/faultdetection_v4.1.engine"
+PLAYBACK_SPEED = 1.0
+OUTPUT_DIR = r"/home/viraj/inference_trial2"
+CONFIDENCE_THRESHOLD = 0.425
+DETERMINISM_LEVEL = 1  # 0 = none, 1 = basic, 2 = GPU-level, 3 = maximum
 
 
-def load_model(model_path):
+def setup_determinism(level: int):
     """
-    Load the YOLO model from various formats (PyTorch, ONNX, or TensorRT engine).
+    Apply determinism settings based on selected level.
 
-    Args:
-        model_path (str): Path to the YOLO model file (.pt, .onnx, or .engine format)
-
-    Returns:
-        YOLO: Loaded YOLO model object ready for inference
+    Levels:
+      0 - No determinism (baseline runtime behavior)
+      1 - Basic determinism (fixed seeds + cudnn deterministic)
+      2 - GPU-level determinism (CUDA workspace sync/config)
+      3 - Maximum determinism (all additional flags)
     """
-    model = YOLO(model_path)
-    return model
+    print(f"\n⚙️  Determinism level: {level}")
+
+    if level == 0:
+        torch.backends.cudnn.deterministic = False
+        torch.backends.cudnn.benchmark = True
+        print("  - No deterministic seeding or CUDA flags")
+        return
+
+    torch.manual_seed(42)
+    np.random.seed(42)
+    torch.cuda.manual_seed_all(42)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    print("  - torch.manual_seed(42)")
+    print("  - np.random.seed(42)")
+    print("  - torch.cuda.manual_seed_all(42)")
+    print("  - cudnn.deterministic = True")
+    print("  - cudnn.benchmark = False")
+
+    if level >= 2:
+        os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+        os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":16:8"
+        print("  - CUDA_LAUNCH_BLOCKING=1")
+        print("  - CUBLAS_WORKSPACE_CONFIG=:16:8")
+
+    if level >= 3:
+        os.environ["CUDNN_DETERMINISTIC"] = "1"
+        os.environ["TF_CUDNN_USE_AUTOTUNE"] = "0"
+        print("  - CUDNN_DETERMINISTIC=1")
+        print("  - TF_CUDNN_USE_AUTOTUNE=0")
 
 
-def preprocess_frame(frame, input_size=(1024, 626)):
-    """
-    Preprocess the frame for model input.
-    Converts greyscale to RGB and applies necessary transformations.
+def detect_system_info() -> dict:
+    """Detect basic system and GPU information."""
+    info = {}
+    try:
+        info['platform'] = platform.platform()
+        info['hostname'] = platform.node()
+        info['python_version'] = platform.python_version()
+    except Exception:
+        pass
 
-    Args:
-        frame (np.ndarray): Input frame from video
-        input_size (tuple): Target size for resizing (width, height)
+    info['torch_version'] = getattr(torch, '__version__', None)
+    info['cuda_available'] = torch.cuda.is_available()
 
-    Returns:
-        torch.Tensor: Preprocessed frame tensor ready for model inference
-
-    Note:
-        YOLO models typically handle preprocessing internally, so this function
-        is kept for compatibility but may not be used if YOLO does its own preprocessing.
-    """
-    # Check if frame is greyscale (single channel) or RGB (3 channels)
-    if len(frame.shape) == 2 or frame.shape[2] == 1:
-        # Greyscale frame - convert to 3-channel by duplicating channels
-        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_GRAY2RGB)
+    gpus = []
+    if info['cuda_available']:
+        try:
+            info['cuda_version'] = torch.version.cuda
+        except Exception:
+            info['cuda_version'] = None
+        try:
+            count = torch.cuda.device_count()
+            for i in range(count):
+                try:
+                    name = torch.cuda.get_device_name(i)
+                except Exception:
+                    name = None
+                try:
+                    mem = torch.cuda.get_device_properties(i).total_memory
+                except Exception:
+                    mem = None
+                gpus.append({'index': i, 'name': name, 'total_memory_bytes': mem})
+        except Exception:
+            pass
     else:
-        # RGB frame - convert from BGR (OpenCV default) to RGB
-        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        # Fallback to nvidia-smi if available
+        try:
+            out = subprocess.check_output(['nvidia-smi', '--query-gpu=name,memory.total', '--format=csv,noheader'], text=True, stderr=subprocess.DEVNULL)
+            for line in out.strip().splitlines():
+                parts = [p.strip() for p in line.split(',')]
+                if parts:
+                    g = {'name': parts[0]}
+                    if len(parts) > 1:
+                        g['memory'] = parts[1]
+                    gpus.append(g)
+        except Exception:
+            pass
 
-    # Resize to model's expected input size
-    frame_resized = cv2.resize(frame_rgb, input_size)
-
-    # Apply normalization transforms (ImageNet standard normalization)
-    transform = transforms.Compose([
-        transforms.ToTensor(),  # Convert to tensor and normalize to [0, 1]
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])  # ImageNet normalization
-    ])
-
-    # Add batch dimension (model expects batch of images)
-    frame_tensor = transform(frame_resized).unsqueeze(0)
-    return frame_tensor
+    info['gpus'] = gpus
+    return info
 
 
-def calculate_iou(bbox1, bbox2):
+# ============================================================================
+# RELIABLE VIDEO FRAME READER (Production Grade)
+# ============================================================================
+
+class ReliableVideoReader:
     """
-    Calculate Intersection over Union (IoU) of two bounding boxes.
-    Used to detect duplicate detections across consecutive frames.
+    Production-grade video frame reader using OpenCV.
+
+    Principle: Count ACTUAL decoded frames, never rely on metadata.
+
+    This ensures consistent behavior across all systems and codecs
+    (local, DGX, cloud, etc.) regardless of video encoding issues.
+    """
+
+    def __init__(self, video_path: str):
+        """
+        Initialize video reader.
+
+        Args:
+            video_path: Path to video file
+
+        Raises:
+            RuntimeError: If video cannot be opened
+        """
+        self.video_path = Path(video_path)
+
+        if not self.video_path.exists():
+            raise FileNotFoundError(f"Video file not found: {video_path}")
+
+        self.cap = cv2.VideoCapture(str(video_path))
+        if not self.cap.isOpened():
+            raise RuntimeError(f"Cannot open video: {video_path}")
+
+        # Get metadata (for information only, not for counting)
+        self.metadata_fps = self.cap.get(cv2.CAP_PROP_FPS)
+        self.metadata_frame_count = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        self.width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        self.height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+        if self.metadata_fps <= 0:
+            self.metadata_fps = 30
+
+        # Real counters (what matters!)
+        self.actual_frame_count = 0
+        self.read_errors = 0
+
+    def read_frame(self) -> Tuple[bool, Optional[np.ndarray], int]:
+        """
+        Read next real frame from video.
+
+        Returns:
+            Tuple of (success, frame, frame_index)
+            - success: True if frame was successfully read
+            - frame: numpy array or None
+            - frame_index: current count of successfully decoded frames
+        """
+        ret, frame = self.cap.read()
+
+        if ret and frame is not None and frame.size > 0:
+            self.actual_frame_count += 1
+            return True, frame, self.actual_frame_count
+        else:
+            if ret:  # Frame read but corrupted
+                self.read_errors += 1
+            return False, None, self.actual_frame_count
+
+    def get_info(self) -> dict:
+        """Get video information."""
+        return {
+            "filename": self.video_path.name,
+            "resolution": f"{self.width}x{self.height}",
+            "fps": self.metadata_fps,
+            "metadata_frame_count": self.metadata_frame_count,
+        }
+
+    def get_actual_frame_count(self) -> int:
+        """Get count of successfully decoded frames."""
+        return self.actual_frame_count
+
+    def get_read_errors(self) -> int:
+        """Get count of corrupted/failed frame reads."""
+        return self.read_errors
+
+    def close(self):
+        """Release video capture."""
+        self.cap.release()
+
+
+# ============================================================================
+# DETECTION UTILITIES
+# ============================================================================
+
+def postprocess_output(results, frame: np.ndarray) -> np.ndarray:
+    """Draw detection results on frame."""
+    return results[0].plot()
+
+
+def load_model(model_path: str) -> YOLO:
+    """Load YOLO model."""
+    return YOLO(model_path)
+
+
+# ============================================================================
+# MAIN PROCESSING PIPELINE
+# ============================================================================
+
+def main(video_path: str, model_path: str, playback_speed: float = 1.0,
+         output_dir: Optional[str] = None, determinism_level: int = DETERMINISM_LEVEL):
+    """
+    Main fault detection pipeline.
 
     Args:
-        bbox1 (list): First bounding box [x1, y1, x2, y2]
-        bbox2 (list): Second bounding box [x1, y1, x2, y2]
-
-    Returns:
-        float: IoU score between 0 and 1 (1.0 = identical boxes, 0.0 = no overlap)
-    """
-    x1_min, y1_min, x1_max, y1_max = bbox1
-    x2_min, y2_min, x2_max, y2_max = bbox2
-
-    # Calculate intersection area
-    intersection_x = max(0, min(x1_max, x2_max) - max(x1_min, x2_min))
-    intersection_y = max(0, min(y1_max, y2_max) - max(y1_min, y2_min))
-    intersection_area = intersection_x * intersection_y
-
-    # Calculate union area
-    area1 = (x1_max - x1_min) * (y1_max - y1_min)
-    area2 = (x2_max - x2_min) * (y2_max - y2_min)
-    union_area = area1 + area2 - intersection_area
-
-    # Calculate IoU
-    iou = intersection_area / union_area if union_area > 0 else 0
-    return iou
-
-
-def get_bbox_center_distance(bbox, frame_width, frame_height):
-    """
-    Calculate distance from bounding box center to frame center.
-    Lower distance = defect more centered in frame.
-
-    Args:
-        bbox (list): Bounding box [x1, y1, x2, y2]
-        frame_width (int): Width of frame
-        frame_height (int): Height of frame
-
-    Returns:
-        float: Euclidean distance from bbox center to frame center
-    """
-    x1, y1, x2, y2 = bbox
-    bbox_center_x = (x1 + x2) / 2
-    bbox_center_y = (y1 + y2) / 2
-
-    frame_center_x = frame_width / 2
-    frame_center_y = frame_height / 2
-
-    # Calculate Euclidean distance
-    distance = np.sqrt((bbox_center_x - frame_center_x) ** 2 +
-                       (bbox_center_y - frame_center_y) ** 2)
-    return distance
-
-
-def postprocess_output(results, frame):
-    """
-    Post-process the YOLO detection results and draw bounding boxes on the frame.
-
-    Args:
-        results (list): YOLO inference results containing detected boxes
-        frame (np.ndarray): Original frame to annotate
-
-    Returns:
-        np.ndarray: Frame with detection bounding boxes and labels drawn
-    """
-    # Use YOLO's built-in plot function to draw all detections on the frame
-    annotated_frame = results[0].plot()  # Get the first result and plot detections
-    return annotated_frame
-
-
-def main(video_path, model_path, playback_speed=1.0, output_dir=None):
-    """
-    Main function to run fault detection on video frames.
-
-    Args:
-        video_path (str): Path to input video file
-        model_path (str): Path to YOLO model (.pt, .onnx, or .engine file)
-        playback_speed (float): Playback speed multiplier (default: 1.0)
-        output_dir (str): Directory to save detected frames (optional)
+        video_path: Path to input video
+        model_path: Path to YOLO model
+        playback_speed: Display speed multiplier
+        output_dir: Output directory for saving frames
+        determinism_level: Selected determinism level (0-3)
     """
 
-    # ========================================================================
-    # START TIMING: Measure total execution time
-    # ========================================================================
     total_start_time = time.time()
 
-    # ========================================================================
-    # STEP 1: Load Model and Check Device
-    # ========================================================================
     print("\n" + "="*70)
-    print("FAULT DETECTION VIDEO PROCESSOR")
+    print("FAULT DETECTION - PRODUCTION PIPELINE")
     print("="*70)
 
-    # Determine device and model type
-    model_extension = model_path.split('.')[-1].lower()
-    is_pytorch_model = model_extension == 'pt'
-    is_onnx_model = model_extension == 'onnx'
+    setup_determinism(determinism_level)
 
-    # For ONNX models, use CPU to avoid CUDA library version conflicts
-    if is_onnx_model:
-        device = "cpu"
-        print("\n⚠️  ONNX models use CPU inference (avoids CUDA library conflicts)")
-    else:
-        device = "cuda:0" if torch.cuda.is_available() else "cpu"
+    # ========================================================================
+    # STEP 1: Load Model
+    # ========================================================================
+    print("\n📦 Loading model...")
+    try:
+        model = load_model(model_path)
+    except Exception as e:
+        print(f"❌ Error loading model: {e}")
+        return
 
-    model = load_model(model_path)
-
-    # Only move PyTorch models to device
-    # .engine and .onnx files are pre-compiled and don't support .to(device)
-    if is_pytorch_model:
-        model.to(device)
-
-    if device.startswith("cuda"):
-        print(f"\n✓ Running inference on GPU ({device})")
-    else:
-        print("\n⚠ Running inference on CPU (CUDA not available)")
-
-    # Show model type
-    model_type = model_extension.upper()
-    model_format_name = {
+    model_extension = Path(model_path).suffix.lower().lstrip('.')
+    model_format = {
         'pt': 'PyTorch',
         'onnx': 'ONNX',
         'engine': 'TensorRT Engine'
     }.get(model_extension, model_extension.upper())
-    print(f"✓ Model type: {model_format_name} (.{model_extension})")
+
+    # Determine device
+    is_pytorch_model = model_extension == 'pt'
+    is_onnx_model = model_extension == 'onnx'
+
+    if is_onnx_model:
+        device = "cpu"
+        print("⚠️  ONNX uses CPU inference (CUDA library compatibility)")
+    else:
+        device = "cuda:0" if torch.cuda.is_available() else "cpu"
+
+    if is_pytorch_model:
+        model.to(device)
+
+    print(f"✓ Model type: {model_format}")
+    if device.startswith("cuda"):
+        print(f"✓ Device: GPU ({device})")
+    else:
+        print(f"✓ Device: CPU")
 
     # ========================================================================
-    # STEP 2: Open Video File and Read Metadata
+    # STEP 2: Open Video (Reliable Frame Reading)
     # ========================================================================
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        print(f"❌ Error: Could not open video file {video_path}")
+    print("\n📹 Opening video...")
+    try:
+        video = ReliableVideoReader(video_path)
+    except Exception as e:
+        print(f"❌ Error opening video: {e}")
         return
 
-    # Auto-detect FPS from input video
-    video_fps = cap.get(cv2.CAP_PROP_FPS)
-    if video_fps <= 0:
-        print("⚠ Warning: Could not detect video FPS, defaulting to 30")
-        video_fps = 30
+    video_info = video.get_info()
+    print(f"✓ File: {video_info['filename']}")
+    print(f"✓ Resolution: {video_info['resolution']}")
+    print(f"✓ FPS: {video_info['fps']}")
+    print(f"✓ Metadata claims: {video_info['metadata_frame_count']} frames")
+    print(f"  (Will count actual decoded frames)")
 
-    # Get video properties
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-
-    print(f"\nVideo Info:")
-    print(f"  Resolution: {width}x{height}")
-    print(f"  FPS: {video_fps}")
-    print(f"  Total frames: {total_frames}")
+    fps = video.metadata_fps
 
     # ========================================================================
-    # STEP 3: Create Output Directory Structure
+    # STEP 3: Create Output Directory
     # ========================================================================
     if output_dir:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        run_dir = os.path.join(output_dir, f"run_{timestamp}")
-        os.makedirs(run_dir, exist_ok=True)
-        faults_dir = os.path.join(run_dir, "faults")
-        os.makedirs(faults_dir, exist_ok=True)
-        print(f"  Saving detected frames to: {run_dir}")
+        run_dir = Path(output_dir) / f"run_{timestamp}"
+        faults_dir = run_dir / "faults"
+        faults_dir.mkdir(parents=True, exist_ok=True)
+        print(f"\n💾 Output directory: {run_dir}")
     else:
         run_dir = None
         faults_dir = None
 
     # ========================================================================
-    # STEP 4: Calculate Frame Display Timing
+    # STEP 4: Display Configuration
     # ========================================================================
-    # Frame delay = (1000ms per frame / FPS) / playback_speed
-    delay = int((1000 / video_fps) / playback_speed)  # milliseconds
+    frame_delay = int((1000 / fps) / playback_speed) if fps > 0 else 33
 
-    print(f"\nProcessing video at {video_fps} FPS with {playback_speed}x playback speed")
-    print("Press 'q' to quit\n")
+    print(f"\n⚙️  Configuration:")
+    print(f"  Playback speed: {playback_speed}x")
+    print(f"  Confidence threshold: {CONFIDENCE_THRESHOLD}")
+    print(f"\nPress 'q' to quit\n")
     print("-"*70)
 
     # ========================================================================
-    # STEP 5: Main Processing Loop - Frame-by-Frame Inference
+    # STEP 5: Main Processing Loop
     # ========================================================================
 
-    # Tracking variables for performance metrics
-    frame_count = 0
-    inference_times = []  # List to store inference time for each frame
-    detection_count = 0   # Total detections across all frames
+    frame_idx = 0
+    detection_count = 0
+    frames_with_detections = 0
+    inference_times = []
 
     while True:
-        # Read next frame from video
-        ret, frame = cap.read()
-        if not ret:
-            print("\n✓ End of video or error reading frame")
+        success, frame, actual_frame_idx = video.read_frame()
+
+        if not success:
+            if frame_idx > 0:
+                print(f"\n✓ End of video")
             break
 
-        frame_count += 1
+        frame_idx += 1
 
-        # ====================================================================
-        # RUN INFERENCE with timing
-        # ====================================================================
-        inference_start = time.time()  # Start timing inference
-
-        # Run YOLO inference on frame (automatic preprocessing by YOLO)
+        # Run inference with timing
+        inf_start = time.time()
         results = model(frame, conf=CONFIDENCE_THRESHOLD, device=device)
+        inf_time = (time.time() - inf_start) * 1000
+        inference_times.append(inf_time)
 
-        inference_end = time.time()  # End timing inference
-        inference_time_ms = (inference_end - inference_start) * 1000  # Convert to milliseconds
-        inference_times.append(inference_time_ms)
+        # Process detections
+        if len(results[0].boxes) > 0:
+            num_detections = len(results[0].boxes)
+            detection_count += num_detections
+            frames_with_detections += 1
 
-        # ====================================================================
-        # POST-PROCESS: Draw Bounding Boxes
-        # ====================================================================
+            # Save frame
+            if faults_dir:
+                confidence = float(results[0].boxes.conf.max())
+                filename = f"frame_{actual_frame_idx:06d}_{num_detections}_{confidence:.2f}.jpg"
+                faults_path = faults_dir / filename
+                cv2.imwrite(str(faults_path), frame)
+
+            print(f"Frame {actual_frame_idx:6d} | {num_detections:2d} det | {inf_time:7.2f}ms | SAVED")
+
+        # Display frame
         processed_frame = postprocess_output(results, frame)
-
-        # ====================================================================
-        # SAVE DETECTIONS
-        # ====================================================================
-        if run_dir and len(results[0].boxes) > 0:
-            current_frame_index = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
-            detections = len(results[0].boxes)
-            detection_count += detections
-            confidence = results[0].boxes.conf.max().item() if detections > 0 else 0
-
-            filename = f"frame_{current_frame_index:04d}_{detections}_{confidence:.2f}.jpg"
-            faults_path = os.path.join(faults_dir, filename)
-            cv2.imwrite(faults_path, frame)
-
-            print(f"Frame {current_frame_index:4d} | Detections: {detections} | Confidence: {confidence:.2f} | SAVED | Inference: {inference_time_ms:.2f}ms")
-
-        # ====================================================================
-        # DISPLAY FRAME
-        # ====================================================================
         cv2.imshow('Fault Detection', processed_frame)
 
-        # Control playback speed and handle user input
-        key = cv2.waitKey(delay) & 0xFF
+        key = cv2.waitKey(frame_delay) & 0xFF
         if key == ord('q'):
-            print("\n⚠ Processing stopped by user (pressed 'q')")
+            print("\n⚠️  Stopped by user")
             break
 
     # ========================================================================
-    # STEP 6: Cleanup and Print Performance Metrics
+    # STEP 6: Cleanup
     # ========================================================================
-    cap.release()
+    video.close()
     cv2.destroyAllWindows()
-
-    # Stop timing total execution
     total_end_time = time.time()
     total_elapsed_time = total_end_time - total_start_time
 
-    # Calculate and display inference time statistics
+    # ========================================================================
+    # STEP 7: Performance Metrics
+    # ========================================================================
+    actual_frame_count = video.get_actual_frame_count()
+    read_errors = video.get_read_errors()
+
     print("\n" + "="*70)
-    print("PROCESSING COMPLETE - PERFORMANCE METRICS")
+    print("PERFORMANCE METRICS")
     print("="*70)
 
+    # Frame count analysis
+    print(f"\n📊 Frame Count:")
+    print(f"  Metadata claimed: {video_info['metadata_frame_count']:,}")
+    print(f"  Actually decoded: {actual_frame_count:,}")
+    print(f"  Read errors: {read_errors}")
+
+    if actual_frame_count != video_info['metadata_frame_count']:
+        discrepancy = actual_frame_count / video_info['metadata_frame_count']
+        print(f"  Discrepancy: {discrepancy:.2f}x (codec/metadata issue)")
+
+    # Detections
+    print(f"\n🔍 Detections:")
+    print(f"  Total: {detection_count:,}")
+    print(f"  Frames with detections: {frames_with_detections}")
+
+    # Inference timing
     if inference_times:
-        avg_inference_time = sum(inference_times) / len(inference_times)
-        min_inference_time = min(inference_times)
-        max_inference_time = max(inference_times)
-        total_inference_time = sum(inference_times)
+        avg_inf = np.mean(inference_times)
+        min_inf = np.min(inference_times)
+        max_inf = np.max(inference_times)
+        total_inf = sum(inference_times)
 
-        # Calculate video duration
-        video_duration_seconds = frame_count / video_fps if video_fps > 0 else 0
-        video_duration_minutes = video_duration_seconds / 60
-        video_duration_hours = video_duration_minutes / 60
+        print(f"\n⏱️  Inference Timing:")
+        print(f"  Average: {avg_inf:.2f} ms/frame")
+        print(f"  Min/Max: {min_inf:.2f} / {max_inf:.2f} ms")
+        print(f"  Total: {total_inf/1000:.2f} seconds")
 
-        # Calculate processing overhead
-        overhead_time = total_elapsed_time - (total_inference_time / 1000)
-        overhead_percentage = (overhead_time / total_elapsed_time * 100) if total_elapsed_time > 0 else 0
+        video_duration = actual_frame_count / fps if fps > 0 else 0
+        achieved_fps = 1000 / avg_inf if avg_inf > 0 else 0
 
-        print(f"\n📹 Video Information:")
-        print(f"  Total frames processed: {frame_count}")
-        print(f"  Video FPS: {video_fps}")
-        print(f"  Original video duration: {video_duration_seconds:.2f} seconds ({video_duration_minutes:.2f} min)")
-        if video_duration_hours > 0:
-            print(f"                            {video_duration_hours:.2f} hours")
-
-        print(f"\n🔍 Detection Summary:")
-        print(f"  Total frames processed: {frame_count}")
-        print(f"  Total detections found: {detection_count}")
-
-        print(f"\n⏱️  Inference Time Statistics:")
-        print(f"  Average per frame: {avg_inference_time:.2f} ms")
-        print(f"  Minimum per frame: {min_inference_time:.2f} ms")
-        print(f"  Maximum per frame: {max_inference_time:.2f} ms")
-        print(f"  Total inference time: {total_inference_time/1000:.2f} seconds ({total_inference_time/1000/60:.2f} min)")
-
-        print(f"\n⏳ Total Execution Time:")
-        print(f"  Total elapsed time (wall clock): {total_elapsed_time:.2f} seconds ({total_elapsed_time/60:.2f} min)")
-        print(f"  Processing overhead (I/O, display, etc): {overhead_time:.2f} seconds ({overhead_percentage:.1f}%)")
-
-        # Calculate speedup
-        speedup_factor = video_duration_seconds / total_elapsed_time if total_elapsed_time > 0 else 0
-        print(f"\n📊 Processing Efficiency:")
-        print(f"  Processing speed: {speedup_factor:.2f}x (processed {speedup_factor:.2f} seconds of video per second)")
-
-        # Calculate FPS achieved
-        achieved_fps = 1000 / avg_inference_time if avg_inference_time > 0 else 0
-        print(f"  Achieved inference FPS: {achieved_fps:.2f} fps")
-        print(f"  Expected video playback FPS: {video_fps}")
-
-        if achieved_fps >= video_fps:
-            print(f"  ✓ Real-time capable: YES (inference fast enough for {video_fps} fps)")
+        print(f"\n📈 Efficiency:")
+        print(f"  Video duration: {video_duration:.2f}s")
+        print(f"  Achieved FPS: {achieved_fps:.1f} fps")
+        print(f"  Required FPS: {fps:.1f} fps")
+        if achieved_fps >= fps:
+            print(f"  ✓ Real-time: YES")
         else:
-            required_speedup = video_fps / achieved_fps
-            print(f"  ✓ Real-time capable: NO (would need {required_speedup:.2f}x faster inference)")
+            print(f"  ✓ Real-time: NO ({fps/achieved_fps:.2f}x speedup needed)")
 
-        # ====================================================================
-        # SAVE METRICS TO TEXT FILE
-        # ====================================================================
-        if run_dir:
-            metrics_file = os.path.join(run_dir, "performance_metrics.txt")
+        print(f"\n⏳ Execution Time:")
+        print(f"  Total: {total_elapsed_time:.2f}s")
+        print(f"  Speedup: {video_duration / total_elapsed_time:.2f}x")
 
-            # Get model info
-            model_filename = os.path.basename(MODEL_PATH)
-            model_extension = os.path.splitext(model_filename)[1]  # .pt, .engine, etc.
-            gpu_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU"
+    # Save metrics to JSON only
+    if run_dir:
+        json_file = run_dir / "metrics.json"
 
-            with open(metrics_file, 'w') as f:
-                f.write("\n" + "="*70 + "\n")
-                f.write("FAULT DETECTION - COMPLETE PERFORMANCE METRICS\n")
-                f.write("="*70 + "\n\n")
+        # gather system info and determinism settings
+        system_info = detect_system_info()
+        determinism_info = {
+            "level": determinism_level,
+            "cudnn_deterministic": bool(getattr(torch.backends.cudnn, 'deterministic', None)),
+            "cudnn_benchmark": bool(getattr(torch.backends.cudnn, 'benchmark', None)),
+            "seeds": {
+                "torch": 42,
+                "numpy": 42,
+                "cuda_all": 42,
+            },
+            "env": {
+                k: os.environ.get(k) for k in (
+                    'CUDA_LAUNCH_BLOCKING', 'CUBLAS_WORKSPACE_CONFIG', 'CUDNN_DETERMINISTIC', 'TF_CUDNN_USE_AUTOTUNE'
+                ) if os.environ.get(k) is not None
+            }
+        }
 
-                f.write("💻 SYSTEM INFORMATION:\n")
-                f.write(f"  GPU/Device: {gpu_name}\n")
-                f.write(f"  CUDA available: {torch.cuda.is_available()}\n")
-                if torch.cuda.is_available():
-                    f.write(f"  CUDA version: {torch.version.cuda}\n")
-                    f.write(f"  cuDNN version: {torch.backends.cudnn.version()}\n")
-                f.write(f"\n")
+        # compute durations
+        total_inference_seconds = (sum(inference_times) / 1000) if inference_times else 0
+        video_duration_seconds = (actual_frame_count / fps) if fps > 0 else 0
+        processing_overhead_seconds = total_elapsed_time - total_inference_seconds
+        processing_overhead_percent = (processing_overhead_seconds / total_elapsed_time * 100) if total_elapsed_time > 0 else 0
 
-                f.write("🔧 MODEL INFORMATION:\n")
-                f.write(f"  Model file: {model_filename}\n")
-                f.write(f"  Model type: {model_extension}\n")
-                f.write(f"  Model path: {MODEL_PATH}\n")
-                f.write(f"  Confidence threshold: {CONFIDENCE_THRESHOLD}\n")
-                f.write(f"  Temporal dedup gap: {DEDUP_MIN_FRAME_GAP} frames\n")
-                f.write(f"\n")
+        model_file = Path(model_path).name if model_path else None
+        model_ext = Path(model_path).suffix if model_path else None
 
-                f.write("📹 VIDEO INFORMATION:\n")
-                f.write(f"  Video file: {os.path.basename(video_path)}\n")
-                f.write(f"  Resolution: {width}x{height}\n")
-                f.write(f"  FPS: {video_fps}\n")
-                f.write(f"  Total frames: {total_frames}\n")
-                f.write(f"  Original video duration: {video_duration_seconds:.2f} seconds ({video_duration_minutes:.2f} min)\n")
-                if video_duration_hours > 0:
-                    f.write(f"                            {video_duration_hours:.2f} hours\n")
-                f.write(f"\n")
+        metrics_data = {
+            "timestamp": datetime.now().isoformat(),
+            "model": {
+                "file": model_file,
+                "type": model_ext,
+                "path": model_path,
+                "confidence_threshold": CONFIDENCE_THRESHOLD,
+            },
+            "video": {
+                "filename": video_info.get('filename'),
+                "resolution": video_info.get('resolution'),
+                "fps": video_info.get('fps'),
+                "metadata_frame_count": video_info.get('metadata_frame_count'),
+                "total_frames_processed": actual_frame_count,
+                "original_duration_seconds": round(video_duration_seconds, 2),
+                "original_duration_readable": f"{video_duration_seconds:.2f} seconds ({video_duration_seconds/60:.2f} min)",
+                "original_duration_hours": round(video_duration_seconds/3600, 2),
+            },
+            "detection_summary": {
+                "total_frames_processed": actual_frame_count,
+                "total_detections_found": detection_count,
+            },
+            "inference": {
+                "avg_ms": float(np.mean(inference_times)) if inference_times else 0,
+                "min_ms": float(np.min(inference_times)) if inference_times else 0,
+                "max_ms": float(np.max(inference_times)) if inference_times else 0,
+                "total_seconds": total_inference_seconds,
+            },
+            "execution": {
+                "total_elapsed_seconds": total_elapsed_time,
+                "processing_overhead_seconds": processing_overhead_seconds,
+                "processing_overhead_percent": round(processing_overhead_percent, 2),
+                "device": device,
+            },
+            "system": system_info,
+            "determinism": determinism_info,
+        }
 
-                f.write("🔍 DETECTION SUMMARY:\n")
-                f.write(f"  Total frames processed: {frame_count}\n")
-                f.write(f"  Total detections found: {detection_count}\n")
-                f.write(f"  Unique detections saved: {unique_count}\n")
-                f.write(f"  Duplicate detections skipped: {duplicate_count}\n")
-                if detection_count > 0:
-                    dedup_percentage = (duplicate_count / detection_count * 100)
-                    f.write(f"  Reduction rate: {dedup_percentage:.1f}%\n")
-                f.write(f"\n")
+        with open(json_file, 'w') as f:
+            json.dump(metrics_data, f, indent=2)
 
-                f.write("⏱️  INFERENCE TIME STATISTICS:\n")
-                f.write(f"  Average per frame: {avg_inference_time:.2f} ms\n")
-                f.write(f"  Minimum per frame: {min_inference_time:.2f} ms\n")
-                f.write(f"  Maximum per frame: {max_inference_time:.2f} ms\n")
-                f.write(f"  Total inference time: {total_inference_time/1000:.2f} seconds ({total_inference_time/1000/60:.2f} min)\n")
-                f.write(f"\n")
+        print(f"✓ JSON data saved to: {json_file}")
 
-                f.write("⏳ TOTAL EXECUTION TIME:\n")
-                f.write(f"  Total elapsed time (wall clock): {total_elapsed_time:.2f} seconds ({total_elapsed_time/60:.2f} min)\n")
-                f.write(f"  Processing overhead (I/O, display, etc): {overhead_time:.2f} seconds ({overhead_percentage:.1f}%)\n")
-                f.write(f"\n")
+    print("\n" + "="*70 + "\n")
 
-                f.write("📊 PROCESSING EFFICIENCY:\n")
-                f.write(f"  Processing speed: {speedup_factor:.2f}x (processed {speedup_factor:.2f} seconds of video per second)\n")
-                f.write(f"  Achieved inference FPS: {achieved_fps:.2f} fps\n")
-                f.write(f"  Expected video playback FPS: {video_fps}\n")
-                f.write(f"\n")
 
-                if achieved_fps >= video_fps:
-                    f.write(f"  ✓ Real-time capable: YES (inference fast enough for {video_fps} fps)\n")
-                else:
-                    required_speedup = video_fps / achieved_fps
-                    f.write(f"  ✓ Real-time capable: NO (would need {required_speedup:.2f}x faster inference)\n")
-
-                f.write("\n" + "="*70 + "\n")
-                f.write(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-                f.write("="*70 + "\n\n")
-
-            print(f"✓ Metrics saved to: {metrics_file}\n")
-
-    print("="*70 + "\n")
+def parse_args():
+    parser = argparse.ArgumentParser(description="Fault detection video pipeline with determinism control")
+    parser.add_argument("--video-path", default=VIDEO_PATH, help="Input video path")
+    parser.add_argument("--model-path", default=MODEL_PATH, help="YOLO model path")
+    parser.add_argument("--output-dir", default=OUTPUT_DIR, help="Output directory for metrics and frames")
+    parser.add_argument("--playback-speed", type=float, default=PLAYBACK_SPEED, help="Playback speed multiplier")
+    parser.add_argument("--determinism-level", type=int, choices=[0, 1, 2, 3], default=DETERMINISM_LEVEL,
+                        help="Determinism level: 0=none, 1=basic, 2=GPU-level, 3=maximum")
+    return parser.parse_args()
 
 
 if __name__ == "__main__":
-    """
-    Script entry point.
-
-    Configuration variables are defined at the top of the file.
-    You can either use the hardcoded paths above, or uncomment the argparse
-    section below to use command line arguments instead.
-    """
-
-    # Option 1: Command line arguments (uncomment to enable)
-    # parser = argparse.ArgumentParser(description='Run fault detection on video frames')
-    # parser.add_argument('video_path', help='Path to the input video file')
-    # parser.add_argument('model_path', help='Path to the PyTorch model (.pt file)')
-    # parser.add_argument('--playback_speed', type=float, default=1.0,
-    #                     help='Playback speed multiplier (default: 1.0)')
-    # args = parser.parse_args()
-    # main(args.video_path, args.model_path, args.playback_speed)
-
-    # Option 2: Using hardcoded configuration variables (currently active)
-    main(VIDEO_PATH, MODEL_PATH, playback_speed=PLAYBACK_SPEED, output_dir=OUTPUT_DIR)
+    args = parse_args()
+    main(
+        video_path=args.video_path,
+        model_path=args.model_path,
+        playback_speed=args.playback_speed,
+        output_dir=args.output_dir,
+        determinism_level=args.determinism_level,
+    )
