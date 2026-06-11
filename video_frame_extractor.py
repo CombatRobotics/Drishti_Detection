@@ -1,5 +1,7 @@
 import cv2
 import os
+import subprocess
+import tempfile
 from datetime import datetime
 
 # Configuration variables - Edit these as needed
@@ -7,29 +9,113 @@ VIDEO_PATH = r"/media/viraj/New Volume/Dhrishti/Day 6/ace_delhi_6_10m20260124_05
 OUTPUT_DIR = r"/media/viraj/New Volume/Dhrishti/Day 6/ace_delhi_6_10m20260124_050136/True_frame_count"                  # Base directory for saving extracted frames
 IMAGE_FORMAT = "png"                                                            # Output image format: jpg, png, bmp
 JPEG_QUALITY = 100                                                               # JPEG quality (1-100), only used if IMAGE_FORMAT is jpg
-USE_CUDA = True                                                                 # Use CUDA decode if available
+TARGET_CODEC = "mpeg4"                                                          # Target codec for preprocessing (deterministic, codec-agnostic)
+FORCE_MPEG4 = True                                                               # If True, transcode input to MPEG-4 before reading
 
 
-def detect_gpu_info():
-    """Detect GPU information for CUDA video decoding."""
+def probe_video_codec(video_path):
+    """Return the codec name and profile for the primary video stream."""
     try:
-        if hasattr(cv2, "cuda"):
-            cuda_device_count = cv2.cuda.getCudaEnabledDeviceCount()
-            if cuda_device_count > 0:
-                return f"{cuda_device_count} CUDA device(s) available"
-            else:
-                return "No CUDA devices detected"
-        else:
-            return "CUDA module not available in OpenCV"
-    except Exception as e:
-        return f"Error detecting GPU: {e}"
+        result = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=codec_name,profile,codec_long_name",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+                video_path,
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            return None
+
+        lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+        if len(lines) < 3:
+            return None
+
+        return {
+            "codec_name": lines[0],
+            "codec_long_name": lines[1],
+            "profile": lines[2],
+        }
+    except FileNotFoundError:
+        return None
+
+
+def transcode_to_mpeg4(video_path):
+    """Transcode the video to MPEG-4 codec using ffmpeg.
+
+    This ensures deterministic, codec-agnostic frame extraction.
+    MPEG-4 is a standard codec that works consistently across all systems.
+    """
+    try:
+        tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".avi")
+        tmp_file.close()
+        output_path = tmp_file.name
+
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            video_path,
+            "-c:v",
+            "mpeg4",
+            "-q:v",
+            "2",
+            "-vtag",
+            "xvid",
+            "-an",
+            output_path,
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            print("⚠ Warning: ffmpeg MPEG-4 transcode failed, falling back to original video file.")
+            print(result.stderr.strip())
+            return video_path
+
+        return output_path
+    except FileNotFoundError:
+        print("⚠ Warning: ffmpeg is not installed or not found in PATH. Skipping MPEG-4 preprocessing.")
+        return video_path
+
+
+def ensure_mpeg4_input(video_path):
+    """Return a video path that is encoded as MPEG-4 for deterministic frame extraction."""
+    if not FORCE_MPEG4:
+        return video_path
+
+    info = probe_video_codec(video_path)
+    if info is None:
+        print("⚠ Could not probe video codec. Proceeding with original file.")
+        return video_path
+
+    codec = info.get("codec_name", "")
+    profile = info.get("profile", "")
+    print(f"Input codec: {codec}, profile: {profile}")
+
+    if codec.lower() == TARGET_CODEC and profile.lower() != "simple profile":
+        print("✓ Input already uses MPEG-4. Using original file.")
+        return video_path
+
+    print("🔄 Transcoding input to MPEG-4 for deterministic frame extraction...")
+    return transcode_to_mpeg4(video_path)
 
 
 def extract_frames(video_path, output_dir, image_format="jpg", jpeg_quality=100):
     """
     Extract all frames from a video file and save them to the output directory.
 
-    Supports both CPU and GPU (CUDA) video decoding for better performance.
+    Uses FFmpeg preprocessing to transcode to MPEG-4 for deterministic, codec-agnostic extraction.
 
     Args:
         video_path: Path to the input video file
@@ -42,74 +128,40 @@ def extract_frames(video_path, output_dir, image_format="jpg", jpeg_quality=100)
         print(f"❌ Error: Video file not found: {video_path}")
         return
 
-    print("\n" + "=" * 60)
-    print("VIDEO FRAME EXTRACTOR")
-    print("=" * 60)
+    print("\n" + "=" * 70)
+    print("VIDEO FRAME EXTRACTOR (Deterministic MPEG-4 Decoding)")
+    print("=" * 70)
 
-    # Display GPU information
-    print(f"\n🖥️  System Info:")
-    print(f"  {detect_gpu_info()}")
-    if USE_CUDA:
-        print(f"  CUDA decode: ENABLED (will attempt GPU acceleration)")
-    else:
-        print(f"  CUDA decode: DISABLED")
+    # Prepare the input file: transcode to MPEG-4 if needed
+    processed_video_path = ensure_mpeg4_input(video_path)
+    transcoded_video_path = None
+    if processed_video_path != video_path:
+        transcoded_video_path = processed_video_path
 
-    # Open video capture (prefer CUDA decode if available)
-    use_cuda = False
-    cuda_reader = None
-    cap = None
+    # Open video capture
+    cap = cv2.VideoCapture(processed_video_path)
+    if not cap.isOpened():
+        print(f"❌ Error: Could not open video file {processed_video_path}")
+        return
 
-    if USE_CUDA:
-        try:
-            if hasattr(cv2, "cuda") and cv2.cuda.getCudaEnabledDeviceCount() > 0:
-                print("✓ CUDA device available, attempting hardware-accelerated video decode...")
-                cuda_reader = cv2.cudacodec.createVideoReader(video_path)
-                use_cuda = True
-                print("✓ Using CUDA video decode")
-            else:
-                print("⚠ No CUDA device found, using CPU decode")
-        except Exception as exc:
-            print(f"⚠ CUDA decode failed ({exc}), falling back to CPU decode")
-            use_cuda = False
-
-    if not use_cuda:
-        cap = cv2.VideoCapture(video_path)
-        if not cap.isOpened():
-            print(f"❌ Error: Could not open video file {video_path}")
-            return
-        print("✓ Using CPU video decode")
-    
-    # Get video properties (use a metadata-only CPU capture when decoding on GPU)
-    video_fps = 0
-    metadata_frame_count = 0
-    width = 0
-    height = 0
-    if use_cuda:
-        meta_cap = cv2.VideoCapture(video_path)
-        if meta_cap.isOpened():
-            video_fps = meta_cap.get(cv2.CAP_PROP_FPS)
-            metadata_frame_count = int(meta_cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            width = int(meta_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-            height = int(meta_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            meta_cap.release()
-    else:
-        video_fps = cap.get(cv2.CAP_PROP_FPS)
-        metadata_frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    # Get video properties
+    video_fps = cap.get(cv2.CAP_PROP_FPS)
+    metadata_frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
     if video_fps <= 0:
-        print("Warning: Could not detect video FPS, defaulting to 30")
+        print("⚠ Warning: Could not detect video FPS, defaulting to 30")
         video_fps = 30
-    
+
     # Get video filename without extension
     video_name = os.path.splitext(os.path.basename(video_path))[0]
-    
+
     # Create output directory with video name and timestamp
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     frames_dir = os.path.join(output_dir, f"{video_name}_{timestamp}")
     os.makedirs(frames_dir, exist_ok=True)
-    
+
     print(f"\n📹 Video Info:")
     print(f"  File: {os.path.basename(video_path)}")
     print(f"  Resolution: {width}x{height}")
@@ -123,37 +175,18 @@ def extract_frames(video_path, output_dir, image_format="jpg", jpeg_quality=100)
     if image_format.lower() == "jpg":
         print(f"  JPEG Quality: {jpeg_quality}")
 
-    print("\n" + "-" * 60)
+    print("\n" + "-" * 70)
     print("Extracting frames...")
-    print("-" * 60)
-    
+    print("-" * 70)
+
     frame_count = 0
     saved_count = 0
-    pending_frame = None
 
-    if use_cuda and (width == 0 or height == 0):
-        ret, gpu_frame = cuda_reader.nextFrame()
-        if not ret:
-            print("Error: Could not read from CUDA decoder")
-            return
-        pending_frame = gpu_frame.download()
-        height, width = pending_frame.shape[:2]
-    
     while True:
-        if pending_frame is not None:
-            frame = pending_frame
-            pending_frame = None
-            ret = True
-        elif use_cuda:
-            ret, gpu_frame = cuda_reader.nextFrame()
-            if not ret:
-                break
-            frame = gpu_frame.download()
-        else:
-            ret, frame = cap.read()
-            if not ret:
-                break
-        
+        ret, frame = cap.read()
+        if not ret:
+            break
+
         frame_count += 1
 
         # Generate filename with zero-padded frame number (fixed 6-digit padding)
@@ -173,14 +206,18 @@ def extract_frames(video_path, output_dir, image_format="jpg", jpeg_quality=100)
         # Print progress every 100 frames
         if frame_count % 100 == 0:
             print(f"  Extracted: {frame_count} frames")
-    
+
     # Clean up
-    if cap is not None:
-        cap.release()
-    
-    print("\n" + "=" * 60)
+    cap.release()
+    if transcoded_video_path is not None and os.path.exists(transcoded_video_path):
+        try:
+            os.remove(transcoded_video_path)
+        except Exception:
+            pass
+
+    print("\n" + "=" * 70)
     print("EXTRACTION COMPLETE")
-    print("=" * 60)
+    print("=" * 70)
     print(f"\nSummary:")
     print(f"  Metadata claimed: {metadata_frame_count}")
     print(f"  Actually decoded: {saved_count}")
@@ -189,8 +226,8 @@ def extract_frames(video_path, output_dir, image_format="jpg", jpeg_quality=100)
         print(f"  Discrepancy: {discrepancy:.2f}x (codec/metadata issue)")
     print(f"  Output directory: {frames_dir}")
     print(f"  Frames per second in source: {video_fps:.2f}")
-    print("=" * 60 + "\n")
-    
+    print("=" * 70 + "\n")
+
     return frames_dir
 
 
@@ -200,10 +237,9 @@ def main():
         video_path=VIDEO_PATH,
         output_dir=OUTPUT_DIR,
         image_format=IMAGE_FORMAT,
-        jpeg_quality=JPEG_QUALITY
+        jpeg_quality=JPEG_QUALITY,
     )
 
 
 if __name__ == "__main__":
     main()
-

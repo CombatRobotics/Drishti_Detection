@@ -1,17 +1,26 @@
 #!/usr/bin/env python3
 """
-Production-Grade Fault Detection Pipeline
-==========================================
+Production-Grade Fault Detection Pipeline with MJPEG Preprocessing
+===================================================================
 
-Reliable video frame processing using OpenCV frame-by-frame decoding.
-Counts ACTUAL decoded frames (not metadata) for reproducibility across systems.
+Reliable video frame processing with guaranteed frame-by-frame accuracy.
+Transcodes input video to MJPEG (Motion JPEG) for deterministic decoding.
+
+MJPEG ensures:
+- Each frame encoded independently
+- No inter-frame dependencies
+- No metadata ambiguity
+- OpenCV reads every frame exactly once
+
+This solves issues with H.264/MPEG-4 VFR videos where OpenCV stops reading
+prematurely based on incorrect metadata.
 
 Key Features:
-- Reliable frame counting (works with any codec)
+- Automatic MJPEG preprocessing via FFmpeg
+- Reliable frame counting (reads actual decoded frames)
 - Production-grade error handling
 - Comprehensive performance metrics
 - Reproducible across systems (local, DGX, cloud)
-- Real-time display with adjustable speed
 """
 
 import os
@@ -22,6 +31,7 @@ import numpy as np
 import json
 import platform
 import subprocess
+import tempfile
 from datetime import datetime
 from pathlib import Path
 import time
@@ -79,6 +89,62 @@ def setup_determinism(level: int):
         os.environ["TF_CUDNN_USE_AUTOTUNE"] = "0"
         print("  - CUDNN_DETERMINISTIC=1")
         print("  - TF_CUDNN_USE_AUTOTUNE=0")
+
+
+def transcode_to_mjpeg(video_path: str) -> str:
+    """
+    Transcode video to MJPEG format for reliable frame-by-frame decoding.
+
+    MJPEG ensures:
+    - Each frame encoded independently
+    - No inter-frame dependencies
+    - Deterministic OpenCV frame reading
+    - No VFR or metadata ambiguity issues
+
+    Args:
+        video_path: Path to input video
+
+    Returns:
+        Path to transcoded MJPEG file
+    """
+    try:
+        tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".avi")
+        tmp_file.close()
+        output_path = tmp_file.name
+
+        print("\n🔄 Transcoding to MJPEG (Motion JPEG)...")
+        print("   This ensures reliable frame-by-frame decoding")
+
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-progress",
+            "pipe:1",
+            "-i",
+            video_path,
+            "-c:v",
+            "mjpeg",
+            "-q:v",
+            "2",
+            "-an",
+            output_path,
+        ]
+
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            print(f"❌ Error: FFmpeg transcode failed")
+            print(result.stderr)
+            raise RuntimeError("MJPEG transcode failed")
+
+        print(f"✓ Transcode complete: {output_path}")
+        return output_path
+
+    except FileNotFoundError:
+        print("❌ Error: ffmpeg not found. Install with: apt-get install ffmpeg")
+        raise
 
 
 def detect_system_info() -> dict:
@@ -254,15 +320,29 @@ def main(video_path: str, model_path: str, playback_speed: float = 1.0,
     total_start_time = time.time()
 
     print("\n" + "="*70)
-    print("FAULT DETECTION - PRODUCTION PIPELINE")
+    print("FAULT DETECTION - MJPEG RELIABLE PIPELINE")
     print("="*70)
 
     setup_determinism(determinism_level)
 
     # ========================================================================
-    # STEP 1: Load Model
+    # STEP 1: MJPEG Preprocessing
     # ========================================================================
-    print("\n📦 Loading model...")
+    print("\n📹 Step 1: MJPEG Preprocessing")
+    print("-" * 70)
+    mjpeg_video_path = None
+    try:
+        mjpeg_video_path = transcode_to_mjpeg(video_path)
+        video_to_process = mjpeg_video_path
+    except Exception as e:
+        print(f"❌ MJPEG transcode failed: {e}")
+        print("Proceeding with original video (may have frame count issues)")
+        video_to_process = video_path
+
+    # ========================================================================
+    # STEP 2: Load Model
+    # ========================================================================
+    print("\n📦 Step 2: Loading model...")
     try:
         model = load_model(model_path)
     except Exception as e:
@@ -296,11 +376,12 @@ def main(video_path: str, model_path: str, playback_speed: float = 1.0,
         print(f"✓ Device: CPU")
 
     # ========================================================================
-    # STEP 2: Open Video (Reliable Frame Reading)
+    # STEP 3: Open Video (Reliable Frame Reading)
     # ========================================================================
-    print("\n📹 Opening video...")
+    print("\n📹 Step 3: Opening Video")
+    print("-" * 70)
     try:
-        video = ReliableVideoReader(video_path)
+        video = ReliableVideoReader(video_to_process)
     except Exception as e:
         print(f"❌ Error opening video: {e}")
         return
@@ -388,15 +469,23 @@ def main(video_path: str, model_path: str, playback_speed: float = 1.0,
             break
 
     # ========================================================================
-    # STEP 6: Cleanup
+    # STEP 7: Cleanup
     # ========================================================================
     video.close()
     cv2.destroyAllWindows()
+
+    # Clean up MJPEG temp file
+    if mjpeg_video_path and os.path.exists(mjpeg_video_path):
+        try:
+            os.remove(mjpeg_video_path)
+        except Exception:
+            pass
+
     total_end_time = time.time()
     total_elapsed_time = total_end_time - total_start_time
 
     # ========================================================================
-    # STEP 7: Performance Metrics
+    # STEP 8: Performance Metrics
     # ========================================================================
     actual_frame_count = video.get_actual_frame_count()
     read_errors = video.get_read_errors()
@@ -481,6 +570,10 @@ def main(video_path: str, model_path: str, playback_speed: float = 1.0,
 
         metrics_data = {
             "timestamp": datetime.now().isoformat(),
+            "preprocessing": {
+                "mjpeg_transcode": mjpeg_video_path is not None,
+                "transcode_method": "FFmpeg to MJPEG (Motion JPEG)",
+            },
             "model": {
                 "file": model_file,
                 "type": model_ext,
