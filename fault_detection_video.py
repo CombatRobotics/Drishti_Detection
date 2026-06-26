@@ -41,12 +41,12 @@ from ultralytics import YOLO
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-VIDEO_PATH = r"/media/viraj/New Volume/Dhrishti/Day 6/ace_delhi_6_10m20260124_050136/ace_delhi_6_10m20260124_050136.avi"
-MODEL_PATH = r"/media/viraj/New Volume/Dhrishti/YOLO/v4.1/faultdetection_v4.1.engine"
+VIDEO_PATH = r"/media/viraj/Dhrishti_2tb/Viraj/Day 6/Delhi_jan_defect_vid/ace_delhi_6_10m20260124_050136.avi"
+MODEL_PATH = r"/home/viraj/Drishti_code/Drishti_Detection/Models/fault_detectionv4.2.pt"
 PLAYBACK_SPEED = 1.0
-OUTPUT_DIR = r"/home/viraj/inference_trial2"
-CONFIDENCE_THRESHOLD = 0.425
-DETERMINISM_LEVEL = 2  # 0 = none, 1 = basic, 2 = GPU-level, 3 = maximum
+OUTPUT_DIR = r"/home/viraj/Drishti_code/Drishti_detection_output/Final_testing"
+CONFIDENCE_THRESHOLD = 0.5
+DETERMINISM_LEVEL = 1  # 0 = none, 1 = basic, 2 = GPU-level, 3 = maximum
 
 
 def setup_determinism(level: int):
@@ -305,7 +305,8 @@ def load_model(model_path: str) -> YOLO:
 # ============================================================================
 
 def main(video_path: str, model_path: str, playback_speed: float = 1.0,
-         output_dir: Optional[str] = None, determinism_level: int = DETERMINISM_LEVEL):
+         output_dir: Optional[str] = None, determinism_level: int = DETERMINISM_LEVEL,
+         categorize: bool = False):
     """
     Main fault detection pipeline.
 
@@ -315,6 +316,7 @@ def main(video_path: str, model_path: str, playback_speed: float = 1.0,
         playback_speed: Display speed multiplier
         output_dir: Output directory for saving frames
         determinism_level: Selected determinism level (0-3)
+        categorize: If True, organize frames by defect class in subfolders
     """
 
     total_start_time = time.time()
@@ -398,12 +400,15 @@ def main(video_path: str, model_path: str, playback_speed: float = 1.0,
     # ========================================================================
     # STEP 3: Create Output Directory
     # ========================================================================
+    class_dirs = {}  # Store class -> directory mapping for categorization
     if output_dir:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         run_dir = Path(output_dir) / f"run_{timestamp}"
         faults_dir = run_dir / "faults"
         faults_dir.mkdir(parents=True, exist_ok=True)
         print(f"\n💾 Output directory: {run_dir}")
+        if categorize:
+            print(f"   Categorization mode: ON (frames organized by defect class)")
     else:
         run_dir = None
         faults_dir = None
@@ -450,12 +455,36 @@ def main(video_path: str, model_path: str, playback_speed: float = 1.0,
             detection_count += num_detections
             frames_with_detections += 1
 
-            # Save frame
+            # Save frame without bounding boxes to cumulative "faults" folder
             if faults_dir:
                 confidence = float(results[0].boxes.conf.max())
                 filename = f"frame_{actual_frame_idx:06d}_{num_detections}_{confidence:.2f}.jpg"
                 faults_path = faults_dir / filename
                 cv2.imwrite(str(faults_path), frame)
+
+            # If categorization enabled, save frames with bounding boxes per class
+            if categorize and run_dir:
+                processed_frame = postprocess_output(results, frame)
+                confidence = float(results[0].boxes.conf.max())
+                filename = f"frame_{actual_frame_idx:06d}_{num_detections}_{confidence:.2f}.jpg"
+
+                # Extract class names and organize by first/primary class
+                boxes = results[0].boxes
+                classes = boxes.cls.cpu().numpy() if hasattr(boxes, 'cls') else []
+
+                if len(classes) > 0:
+                    # Use class of the first (usually highest confidence) detection
+                    class_idx = int(classes[0])
+                    class_name = results[0].names.get(class_idx, f"class_{class_idx}")
+
+                    # Create class directory if not exists
+                    if class_name not in class_dirs:
+                        class_dir = run_dir / class_name
+                        class_dir.mkdir(parents=True, exist_ok=True)
+                        class_dirs[class_name] = class_dir
+
+                    class_path = class_dirs[class_name] / filename
+                    cv2.imwrite(str(class_path), processed_frame)
 
             print(f"Frame {actual_frame_idx:6d} | {num_detections:2d} det | {inf_time:7.2f}ms | SAVED")
 
@@ -626,6 +655,8 @@ def parse_args():
     parser.add_argument("--playback-speed", type=float, default=PLAYBACK_SPEED, help="Playback speed multiplier")
     parser.add_argument("--determinism-level", type=int, choices=[0, 1, 2, 3], default=DETERMINISM_LEVEL,
                         help="Determinism level: 0=none, 1=basic, 2=GPU-level, 3=maximum")
+    parser.add_argument("--categorize", action="store_true",
+                        help="Organize frames by defect class in subfolders (with bboxes); cumulative 'faults' folder has frames without bboxes")
     return parser.parse_args()
 
 
@@ -637,4 +668,5 @@ if __name__ == "__main__":
         playback_speed=args.playback_speed,
         output_dir=args.output_dir,
         determinism_level=args.determinism_level,
+        categorize=args.categorize,
     )
