@@ -11,8 +11,9 @@ from pathlib import Path
 import subprocess
 import time
 
-ROSBAG_FOLDER = "/media/viraj/9ab9ab55-5238-4bd4-ab76-54c20d1c2d0f/home/combat-ind-nuc/Viraj/rosbag2_2026_06_25-01_47_36"
-IMAGE_TOPIC = "/ace_camera_rail_right/pylon_ros2_camera_node_ace_rail_right/image/compressed"
+ROSBAG_FOLDER = "/media/viraj/e84db5a4-80aa-41f1-a173-de4e78ab820d1/home/cri-pc-0/june-july-dhristi-bags/day1_20260630_024350"
+IMAGE_TOPIC = "/ace_camera_rail_left/pylon_ros2_camera_node_ace_rail_left/image/compressed"
+OUTPUT_DIR = "/media/viraj/e84db5a4-80aa-41f1-a173-de4e78ab820d1/home/cri-pc-0/june-july-dhristi-bags/day1_20260630_024350/left_data"
 
 class FrameCapture(Node):
     def __init__(self, topic, output_path=None, timestamps_only=False):
@@ -86,8 +87,10 @@ def main():
     args = parser.parse_args()
 
     # Determine output path
-    output_video = Path(ROSBAG_FOLDER) / "output.avi"
-    output_timestamps = Path(ROSBAG_FOLDER) / "frame_timestamps.json"
+    output_dir = Path(OUTPUT_DIR)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_video = output_dir / "output.avi"
+    output_timestamps = output_dir / "frame_timestamps.json"
 
     print("\n" + "="*70)
     if args.timestamps:
