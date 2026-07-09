@@ -43,6 +43,7 @@ from ultralytics import YOLO
 # ============================================================================
 VIDEO_PATH = r"/media/viraj/Dhrishti_2tb/Viraj/Day 6/Delhi_jan_defect_vid/ace_delhi_6_10m20260124_050136.avi"
 MODEL_PATH = r"/home/viraj/Drishti_code/Drishti_Detection/Models/fault_detectionv4.2.pt"
+MASK_PATH = "/home/viraj/Drishti_code/Drishti_Detection/Mask.png"  # Set to mask image path to restrict detection to white regions only
 PLAYBACK_SPEED = 1.0
 OUTPUT_DIR = r"/home/viraj/Drishti_code/Drishti_detection_output/Final_testing"
 CONFIDENCE_THRESHOLD = 0.5
@@ -89,6 +90,47 @@ def setup_determinism(level: int):
         os.environ["TF_CUDNN_USE_AUTOTUNE"] = "0"
         print("  - CUDNN_DETERMINISTIC=1")
         print("  - TF_CUDNN_USE_AUTOTUNE=0")
+
+
+def load_mask(mask_path: str) -> Optional[np.ndarray]:
+    """Load mask image and ensure it's binary (0 or 255)."""
+    if not mask_path:
+        return None
+
+    try:
+        mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+        if mask is None:
+            print(f"❌ Could not load mask: {mask_path}")
+            return None
+
+        # Threshold to ensure binary (0 or 255 only)
+        _, mask = cv2.threshold(mask, 127, 255, cv2.THRESH_BINARY)
+        print(f"✓ Mask loaded: {mask_path} (shape: {mask.shape})")
+        return mask
+    except Exception as e:
+        print(f"❌ Error loading mask: {e}")
+        return None
+
+
+def is_detection_in_mask(box, mask_resized: np.ndarray) -> bool:
+    """Check if detection box center is in the white mask region."""
+    try:
+        # Get box coordinates (xyxy format: x1, y1, x2, y2)
+        x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
+
+        # Calculate center
+        cx = int((x1 + x2) / 2)
+        cy = int((y1 + y2) / 2)
+
+        # Clamp to image bounds
+        h, w = mask_resized.shape
+        cx = max(0, min(cx, w - 1))
+        cy = max(0, min(cy, h - 1))
+
+        # Check if center is in white region (255)
+        return mask_resized[cy, cx] == 255
+    except Exception:
+        return True  # On error, accept detection
 
 
 def transcode_to_mjpeg(video_path: str) -> str:
@@ -358,6 +400,14 @@ def main(video_path: str, model_path: str, playback_speed: float = 1.0,
         'engine': 'TensorRT Engine'
     }.get(model_extension, model_extension.upper())
 
+    # Load mask if provided
+    print("\n📍 Step 2.5: Loading mask...")
+    mask = load_mask(MASK_PATH) if MASK_PATH else None
+    if MASK_PATH and mask is None:
+        print("⚠️  Mask loading failed, proceeding without mask")
+    elif not MASK_PATH:
+        print("  No mask provided - detecting on full frame")
+
     # Determine device
     is_pytorch_model = model_extension == 'pt'
     is_onnx_model = model_extension == 'onnx'
@@ -432,6 +482,7 @@ def main(video_path: str, model_path: str, playback_speed: float = 1.0,
     detection_count = 0
     frames_with_detections = 0
     inference_times = []
+    mask_resized = None
 
     while True:
         success, frame, actual_frame_idx = video.read_frame()
@@ -443,11 +494,27 @@ def main(video_path: str, model_path: str, playback_speed: float = 1.0,
 
         frame_idx += 1
 
+        # Initialize/resize mask if needed
+        if mask is not None and mask_resized is None:
+            h, w = frame.shape[:2]
+            mask_resized = cv2.resize(mask, (w, h), interpolation=cv2.INTER_NEAREST)
+            _, mask_resized = cv2.threshold(mask_resized, 127, 255, cv2.THRESH_BINARY)
+            print(f"✓ Mask resized to frame resolution: {w}x{h}")
+
         # Run inference with timing
         inf_start = time.time()
         results = model(frame, conf=CONFIDENCE_THRESHOLD, device=device)
         inf_time = (time.time() - inf_start) * 1000
         inference_times.append(inf_time)
+
+        # Filter detections by mask
+        if mask is not None and len(results[0].boxes) > 0:
+            filtered_indices = [i for i, box in enumerate(results[0].boxes)
+                               if is_detection_in_mask(box, mask_resized)]
+            if len(filtered_indices) > 0:
+                results[0].boxes = results[0].boxes[filtered_indices]
+            else:
+                results[0].boxes = results[0].boxes[:0]  # Empty boxes
 
         # Process detections
         if len(results[0].boxes) > 0:

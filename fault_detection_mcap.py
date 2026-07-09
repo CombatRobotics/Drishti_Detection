@@ -13,6 +13,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 from sensor_msgs.msg import Image, CompressedImage
+from std_msgs.msg import Float32, Int32
 from cv_bridge import CvBridge
 import cv2
 import torch
@@ -30,11 +31,13 @@ import os
 # ============================================================================
 # CONFIGURATION - MODIFY THIS SECTION FOR YOUR ROSBAG2 AND SETUP
 # ============================================================================
-ROSBAG_FOLDER = r"/media/viraj/e84db5a4-80aa-41f1-a173-de4e78ab820d1/home/cri-pc-0/june-july-dhristi-bags/day1_20260630_024350"
+ROSBAG_FOLDER = r"/media/viraj/e84db5a4-80aa-41f1-a173-de4e78ab820d1/home/cri-pc-0/june-july-dhristi-bags/day_5/day5_pt1_dhristi_railhead_cameras_20260709_022422"
 IMAGE_TOPIC = "/ace_camera_rail_left/pylon_ros2_camera_node_ace_rail_left/image/compressed"
+ENCODER_TOPIC = "/left_encoder_mm"  # Set to encoder topic name (e.g., "/right_encoder_mm") to capture encoder data for detections
 
-MODEL_PATH = r"/home/viraj/Drishti_code/Drishti_Detection/Models/fault_detectionv4.2.pt"
-OUTPUT_DIR = r"/media/viraj/e84db5a4-80aa-41f1-a173-de4e78ab820d1/home/cri-pc-0/june-july-dhristi-bags/day1_20260630_024350/left_data"
+MODEL_PATH = r"/home/viraj/Drishti_code/Drishti_Detection/Models/fault_detectionv4.3.pt"
+OUTPUT_DIR = r"/media/viraj/e84db5a4-80aa-41f1-a173-de4e78ab820d1/home/cri-pc-0/june-july-dhristi-bags/day_5/day5_pt1_dhristi_railhead_cameras_20260709_022422/left_data"
+MASK_PATH = "/home/viraj/Drishti_code/Drishti_Detection/Mask.png"  # Set to mask image path to restrict detection to white regions only
 CONFIDENCE_THRESHOLD = 0.35
 DETERMINISM_LEVEL = 1
 CATEGORIZE = True
@@ -79,6 +82,26 @@ def check_multiple_publishers(image_topic: str) -> int:
         return publisher_count
     except Exception as e:
         print(f"⚠️  Could not check publishers: {e}")
+        return None
+
+
+def load_mask(mask_path: str) -> Optional[np.ndarray]:
+    """Load mask image and ensure it's binary (0 or 255)."""
+    if not mask_path:
+        return None
+
+    try:
+        mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+        if mask is None:
+            print(f"❌ Could not load mask: {mask_path}")
+            return None
+
+        # Threshold to ensure binary (0 or 255 only)
+        _, mask = cv2.threshold(mask, 127, 255, cv2.THRESH_BINARY)
+        print(f"✓ Mask loaded: {mask_path} (shape: {mask.shape})")
+        return mask
+    except Exception as e:
+        print(f"❌ Error loading mask: {e}")
         return None
 
 
@@ -156,6 +179,26 @@ class FaultDetectionNode(Node):
 
         self.get_logger().info(f"✓ Subscribed to {self.image_topic}\n")
 
+        # Subscribe to encoder topic if provided
+        self.encoder_topic = ENCODER_TOPIC
+        self.latest_encoder_value = None
+        self.encoder_sub = None
+        if self.encoder_topic:
+            try:
+                self.encoder_sub = self.create_subscription(
+                    Float32,
+                    self.encoder_topic,
+                    self.encoder_callback,
+                    qos_profile
+                )
+                self.get_logger().info(f"✓ Subscribed to encoder topic: {self.encoder_topic}\n")
+            except Exception as e:
+                self.get_logger().warning(f"⚠️  Could not subscribe to encoder topic: {e}\n")
+
+        # Load mask if provided
+        self.mask = None
+        self.mask_resized = None
+
         # Stats
         self.frame_count = 0
         self.detection_count = 0
@@ -166,6 +209,7 @@ class FaultDetectionNode(Node):
         self.expected_frames = None
         self.current_timestamp_sec = 0
         self.current_timestamp_nsec = 0
+        self.detections_with_encoder = []  # Store detection + encoder data for JSON
 
     def image_callback(self, msg):
         """Callback to detect faults in image messages."""
@@ -193,11 +237,27 @@ class FaultDetectionNode(Node):
             self.current_timestamp_sec = timestamp_sec
             self.current_timestamp_nsec = timestamp_nsec
 
+            # Initialize/resize mask if needed
+            if self.mask is not None and self.mask_resized is None:
+                h, w = frame.shape[:2]
+                self.mask_resized = cv2.resize(self.mask, (w, h), interpolation=cv2.INTER_NEAREST)
+                _, self.mask_resized = cv2.threshold(self.mask_resized, 127, 255, cv2.THRESH_BINARY)
+                self.get_logger().info(f"✓ Mask resized to frame resolution: {w}x{h}")
+
             # Run detection
             inf_start = time.time()
             results = self.model(frame, conf=CONFIDENCE_THRESHOLD, device=self.device)
             inf_time = (time.time() - inf_start) * 1000
             self.inference_times.append(inf_time)
+
+            # Filter detections by mask
+            if self.mask is not None and len(results[0].boxes) > 0:
+                filtered_indices = [i for i, box in enumerate(results[0].boxes)
+                                   if self.is_detection_in_mask(box)]
+                if len(filtered_indices) > 0:
+                    results[0].boxes = results[0].boxes[filtered_indices]
+                else:
+                    results[0].boxes = results[0].boxes[:0]  # Empty boxes
 
             # Process detections
             if len(results[0].boxes) > 0:
@@ -213,6 +273,19 @@ class FaultDetectionNode(Node):
                 filename = f"frame_{date_str}_{time_str}.{microsec:06d}_{num_detections}.jpg"
                 faults_path = self.faults_dir / filename
                 cv2.imwrite(str(faults_path), frame)
+
+                # Capture encoder value at moment of detection
+                encoder_entry = {
+                    "frame_number": self.frame_count,
+                    "frame_timestamp_sec": self.current_timestamp_sec,
+                    "frame_timestamp_nanosec": self.current_timestamp_nsec,
+                    "frame_timestamp_ist": dt.strftime("%Y-%m-%d %H:%M:%S.%f"),
+                    "frame_filename": filename,
+                    "num_detections": num_detections,
+                    "encoder_value": self.latest_encoder_value
+                }
+
+                self.detections_with_encoder.append(encoder_entry)
 
                 # Categorize by class if enabled
                 if CATEGORIZE:
@@ -239,6 +312,38 @@ class FaultDetectionNode(Node):
 
         except Exception as e:
             self.get_logger().error(f"Error processing frame: {e}")
+
+    def encoder_callback(self, msg):
+        """Callback to store latest encoder value."""
+        try:
+            # Just store the latest encoder value
+            self.latest_encoder_value = float(msg.data)
+        except Exception as e:
+            self.get_logger().error(f"Error processing encoder data: {e}")
+
+    def is_detection_in_mask(self, box) -> bool:
+        """Check if detection box center is in the white mask region."""
+        if self.mask_resized is None:
+            return True  # No mask, accept all detections
+
+        try:
+            # Get box coordinates (xyxy format: x1, y1, x2, y2)
+            x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
+
+            # Calculate center
+            cx = int((x1 + x2) / 2)
+            cy = int((y1 + y2) / 2)
+
+            # Clamp to image bounds
+            h, w = self.mask_resized.shape
+            cx = max(0, min(cx, w - 1))
+            cy = max(0, min(cy, h - 1))
+
+            # Check if center is in white region (255)
+            return self.mask_resized[cy, cx] == 255
+        except Exception as e:
+            self.get_logger().error(f"Error checking mask: {e}")
+            return True  # On error, accept detection
 
     def finalize(self, total_elapsed_time, device):
         """Save metrics and display results."""
@@ -332,6 +437,24 @@ class FaultDetectionNode(Node):
             json.dump(metrics, f, indent=2)
 
         self.get_logger().info(f"\n✓ Metrics saved: {metrics_file}")
+
+        # Save encoder-detection data if available
+        if self.detections_with_encoder and ENCODER_TOPIC:
+            encoder_json_file = self.faults_dir / "detections_with_encoder.json"
+            encoder_data = {
+                "timestamp": datetime.now().isoformat(),
+                "rosbag_folder": ROSBAG_FOLDER,
+                "image_topic": IMAGE_TOPIC,
+                "encoder_topic": ENCODER_TOPIC,
+                "total_detections": len(self.detections_with_encoder),
+                "detections": self.detections_with_encoder
+            }
+
+            with open(encoder_json_file, 'w') as f:
+                json.dump(encoder_data, f, indent=2)
+
+            self.get_logger().info(f"✓ Encoder-detection data saved: {encoder_json_file}")
+
         self.get_logger().info("="*70 + "\n")
 
 
@@ -352,6 +475,8 @@ def main():
     print(f"\n📋 Configuration:")
     print(f"  Rosbag folder: {rosbag_folder.name}")
     print(f"  Image topic: {IMAGE_TOPIC}")
+    if ENCODER_TOPIC:
+        print(f"  Encoder topic: {ENCODER_TOPIC}")
     print(f"  Model: {Path(MODEL_PATH).name}")
     print(f"  Output dir: {OUTPUT_DIR}\n")
 
@@ -378,11 +503,24 @@ def main():
     node = FaultDetectionNode(IMAGE_TOPIC, MODEL_PATH, OUTPUT_DIR)
     node.expected_frames = expected_frames
 
+    # Load mask if provided
+    if MASK_PATH:
+        print(f"📍 Mask path: {MASK_PATH}")
+        node.mask = load_mask(MASK_PATH)
+        if node.mask is None:
+            print("⚠️  Mask loading failed, proceeding without mask")
+    else:
+        print("📍 No mask provided - detecting on full frame")
+
     print("🎥 Starting bag playback and detection...\n")
 
     # Play bag in subprocess
+    topics_to_play = [IMAGE_TOPIC]
+    if ENCODER_TOPIC:
+        topics_to_play.append(ENCODER_TOPIC)
+
     bag_process = subprocess.Popen(
-        ["ros2", "bag", "play", str(ROSBAG_FOLDER), "--topics", IMAGE_TOPIC],
+        ["ros2", "bag", "play", str(ROSBAG_FOLDER), "--topics"] + topics_to_play,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL
     )
