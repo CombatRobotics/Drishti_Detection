@@ -229,6 +229,12 @@ class MultiCameraEncoderCapture(Node):
             ts_ns = self.get_clock().now().nanoseconds
             value_mm = float(msg.data)
 
+            # Validation: warn if timestamp looks corrupted
+            if ts_ns == 0 or ts_ns < 1_000_000_000:
+                self.get_logger().warning(
+                    f"⚠️  Encoder {side} sample {self.encoder_count[side]+1}: timestamp_ns={ts_ns} (possibly pre-clock, /clock not ready yet)"
+                )
+
             self.encoder_raw[side].append((ts_ns, value_mm))
             self.encoder_count[side] += 1
 
@@ -429,24 +435,76 @@ def main():
             proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             processes.append(proc)
 
-        time.sleep(1)  # Give processes time to start
+        time.sleep(0.5)  # Give processes time to start
 
         # Initialize ROS and capture node
         rclpy.init()
+
+        # CRITICAL: Wait for /clock to be published before creating the node
+        # This prevents encoder callbacks from getting timestamp_ns=0 (pre-clock)
+        if session_info['encoder_source_bag']:
+            print("\nWaiting for /clock to sync from encoder source bag...")
+            temp_node = rclpy.create_node('clock_sync_waiter')
+            clock_ready = False
+            wait_start = time.time()
+            while not clock_ready and (time.time() - wait_start) < 10:
+                try:
+                    ts = temp_node.get_clock().now().nanoseconds
+                    # If we get a non-zero timestamp, /clock is publishing
+                    if ts > 1_000_000_000:  # Sanity check: timestamp > 1 second since epoch
+                        clock_ready = True
+                        print(f"✓ /clock synchronized ({ts} ns)")
+                        break
+                except:
+                    pass
+                time.sleep(0.1)
+            temp_node.destroy_node()
+            if not clock_ready:
+                print("⚠️  /clock did not sync within 10 seconds, continuing anyway...")
+
         node = MultiCameraEncoderCapture(selected_cameras, encoder_topic_list, output_dir)
 
         print("\nSpinning... (waiting for bag playback to complete)")
 
-        # Spin until all processes exit
+        # Spin until all processes exit, with timeout protection
+        # (ros2 bag play can hang, so we need a safety timeout)
+        import time as time_module
+        max_idle_time = 60  # If no messages for 60 seconds, assume we're done
+        last_frame_time = time_module.time()
+        frame_count_before = node.frame_count['rail_left'] if 'rail_left' in node.frame_count else 0
+
         try:
             while any(proc.poll() is None for proc in processes):
+                # Track if we're receiving messages
+                current_frame_count = sum(node.frame_count.values())
+                if current_frame_count > frame_count_before:
+                    # We got new messages, reset idle timer
+                    last_frame_time = time_module.time()
+                    frame_count_before = current_frame_count
+                else:
+                    # No new messages, check if we've exceeded idle timeout
+                    idle_time = time_module.time() - last_frame_time
+                    if idle_time > max_idle_time:
+                        print(f"\n⚠️  No new messages for {max_idle_time}s, forcing exit (subprocesses may be hung)")
+                        # Kill stuck subprocesses
+                        for proc in processes:
+                            if proc.poll() is None:
+                                proc.terminate()
+                                time_module.sleep(0.5)
+                                if proc.poll() is None:
+                                    proc.kill()
+                        break
+
                 rclpy.spin_once(node, timeout_sec=0.1)
         except KeyboardInterrupt:
             print("\n⚠️  Interrupted by user")
 
-        # Final drain
-        for _ in range(10):
+        # Final drain (increased from 10 to 100 iterations to handle backlog)
+        print("Draining remaining messages...")
+        for i in range(100):
             rclpy.spin_once(node, timeout_sec=0.1)
+            if i % 20 == 0 and i > 0:
+                print(f"  Drained {i}/100 iterations...")
 
         # Finalize
         manifest = node.finalize()
